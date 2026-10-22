@@ -61,6 +61,20 @@ please report it to whoever runs the site (for this repository: open an issue, o
   which keeps it hidden.
 - Room tickets are signed with a secret only the server knows (`NETPLAY_SECRET`).
 
+## The desktop app (`desktop/`)
+
+- **Built on your Mac from your own copy** (`desktop/build-mac.sh`): no game files or engine come from
+  anywhere else.
+  - Its tools are each checked against checksums written in the script: Electron, the Java runtime, Ghidra,
+    Emscripten's archives, and the translator's two Python packages (by hash, wheels only).
+  - Emscripten installs only from the archives the script checked.
+- **The app downloads, updates and runs nothing else.** It serves only its own files (`app://cricket07`, with
+  no way out of its folder).
+- **It talks only to** the room server it was built with and the STUN/TURN servers that server names.
+- **Its window** is sandboxed (no Node.js, context isolation). Links open in your browser, https only. The page
+  may ask only for folder pickers, the clipboard, pointer lock and full screen.
+- **Signing:** the app is signed ad hoc for the Mac that built it.
+
 ## Hosting a test site (`deploy/vm/setup.sh`)
 
 - Serves the page with the **stand-in engine**, never game files or a game engine build, with a banner

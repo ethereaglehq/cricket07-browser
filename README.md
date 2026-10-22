@@ -50,6 +50,9 @@ Controls: a game controller, or the keyboard (arrow keys to move, **S** to selec
 cursor). Use `RC_NO_AUDIO=1` to mute the native app, or `?mute` on the page. Both players in an online
 match need the same build and the same game files.
 
+**On a Mac, as an app:** `bash desktop/build-mac.sh "/path/to/Cricket 07"` does all of the above (with pinned,
+checked tools) and builds `Cricket 07.app`, online play included. See [desktop/README.md](desktop/README.md).
+
 ## Saves, patches and rosters
 
 - **Saves** live in the browser's private storage, which a browser may clear (low disk space, clearing
