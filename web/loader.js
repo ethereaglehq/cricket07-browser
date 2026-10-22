@@ -266,6 +266,7 @@ function showNetStatus(M, session) {
   const el = $('netstatus');
   el.classList.remove('hidden');
   let lastFrame = 0, lastT = performance.now();
+  const stallLog = [];   // [time, stalls so far], a minute of them
   setInterval(() => {
     if (engineDead) { el.classList.add('hidden'); return; }
     const frame = M._netplay_status(0), desync = M._netplay_status(2), stalls = M._netplay_status(3);
@@ -275,13 +276,20 @@ function showNetStatus(M, session) {
     const fps = ((frame - lastFrame) * 1000) / Math.max(1, now - lastT);
     lastFrame = frame; lastT = now;
     el.classList.toggle('bad', !!desync);
-    // the round trip the inputs ride on, and how many frames the delay failed to cover (a stall is a
-    // frame that waited over 10 ms for the others' inputs: the game froze that long)
+    // the input delay (it adapts to the connection: netplay.js), the path the inputs ride on and its round
+    // trip, and how often lately the delay failed to cover it (a stall is a frame that waited over 10 ms for
+    // the others' inputs: the game froze that long)
+    const delay = session.client.delay();
+    const adjusting = delay.changedAt && now - delay.changedAt < 3000 ? ', adjusting' : '';
     const trips = session.client.trips();
-    const path = trips.direct ? `direct ${trips.direct} ms` : `relayed ${trips.room} ms`;
+    const path = trips.direct ? `direct${trips.via ? ` (${trips.via})` : ''} ${trips.direct} ms` : `through the room ${trips.room} ms`;
+    stallLog.push([now, stalls]);
+    while (now - stallLog[0][0] > 60000) stallLog.shift();
+    const recent = stalls - stallLog[0][1];
     el.textContent = desync ? `Out of sync since frame ${desync}: restart the session`
-      : `Online · player ${session.you + 1} of ${session.players} · delay ${session.delay}` +
-        ` · ${path}` + (stalls ? ` · ${stalls} stalls` : '') +
+      : `Online · player ${session.you + 1} of ${session.players}` +
+        ` · delay ${delay.frames} frames (${Math.round(delay.frames * 1000 / 60)} ms${adjusting})` +
+        ` · ${path}` + (recent ? ` · ${recent} stalls/min` : '') +
         (session.reconnecting ? ' · reconnecting…' : frame > 300 && fps < 50 ? ' · waiting for players' : '') +
         (session.left?.size ? ` · ${session.left.size} left` : '');
   }, 1000);
