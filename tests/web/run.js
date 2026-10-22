@@ -234,6 +234,169 @@ test('saves: warns when the browser may clear its storage', async ({ browser, ba
   assert.match(await page.textContent('#saves-note'), /may clear the game’s storage/);
 });
 
+// ---- patches and rosters (web/patches.js)
+
+// a patch as a player has it after unpacking: <tmp>/<name>/...
+function makePatch(name, files) {
+  const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'c07-patch-')), name);
+  for (const [rel, data] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), data);
+  }
+  return dir;
+}
+const gameFolder = (page) => savedFiles(page, 'rcgame');
+const markerVersion = (page) => page.evaluate(async () => JSON.parse(await (await (await (await (await navigator.storage.getDirectory())
+  .getDirectoryHandle('rcgame')).getFileHandle('.installed.json')).getFile()).text()).version);
+
+async function planPatch(page, input, file) {
+  if (await page.isVisible('#go-patches')) await page.click('#go-patches');
+  await page.setInputFiles(input, file);
+  await page.waitForSelector('#patch-plan:not(.hidden), #patch-msg.warn');
+  return page.textContent('#view-patches');
+}
+async function installPatch(page, input, file) {
+  const plan = await planPatch(page, input, file);
+  await page.click('#patch-install');
+  await page.waitForFunction(() => /Installed “/.test(document.getElementById('patch-msg').textContent));
+  return plan;
+}
+async function removeLastPatch(page, name) {
+  page.once('dialog', (d) => d.accept());
+  await page.click('#patch-list button');
+  await page.waitForFunction((n) => document.getElementById('patch-msg').textContent === `Removed “${n}”.`, name);
+}
+
+const IPL = {
+  'Data/data.gob': 'BIGF patched archive, IPL 4',
+  'data/Kits/csk.fsh': 'kit: Chennai',
+  'data/kits/mi.fsh': 'kit: Mumbai',
+  'readme.txt': 'IPL 4 patch',
+  'IPL4_TCF.ros/roster.dat': 'IPL 4 roster',
+  'Cricket07.exe': 'MZ modified game program',
+  'd3d8.dll': 'MZ wrapper library',
+  'Data/sneaky.fsh': Buffer.from([0x4d, 0x5a, 0x90, 0, 3, 0, 0, 0]),
+  '__MACOSX/Data/._csk.fsh': 'mac junk',
+};
+
+test('patches: install from a folder, then remove it', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  await playAndSave(page, 0);   // the game makes its folder in My Documents on its first start
+  const original = await gameFolder(page), version0 = await markerVersion(page);
+  const plan = await installPatch(page, '#patch-folder', makePatch('IPL 4 Patch', IPL));
+  assert.match(plan, /4 files for the game folder, 1 of them replacing the game's own/);
+  assert.match(plan, /1 file of rosters/);
+  assert.match(plan, /Skipped 3 files: /);
+  for (const f of ['Cricket07.exe', 'd3d8.dll', 'Data/sneaky.fsh']) assert.ok(plan.includes(`${f} (a program)`), `${f} not refused`);
+  const after = await gameFolder(page);
+  assert.strictEqual(after['Data/data.gob'], IPL['Data/data.gob']);
+  // Kits/ and kits/ in the patch become one folder (spelled as the first one met)
+  const kits = Object.keys(after).filter((p) => /^Data\/kits\//i.test(p));
+  assert.strictEqual(new Set(kits.map((p) => p.split('/')[1])).size, 1, kits.join(', '));
+  assert.deepStrictEqual(kits.map((p) => after[p]).sort(), ['kit: Chennai', 'kit: Mumbai']);
+  assert.ok(!Object.keys(after).some((p) => /^data\/|Cricket07\.exe$|\.dll$|sneaky|MACOSX/.test(p)), Object.keys(after).join(', '));
+  assert.strictEqual(after['game.exe'], original['game.exe'], 'the game program changed');
+  assert.strictEqual((await savedFiles(page))[DOCS + 'IPL4_TCF.ros/roster.dat'], 'IPL 4 roster');
+  assert.notStrictEqual(await markerVersion(page), version0, 'online version ignores the patch');
+  assert.match(await page.textContent('#patch-list'), /IPL 4 Patch/);
+  // the game sees the patch
+  await page.click('[data-go="home"]');
+  await page.click('#play');
+  await waitFrames(page, 5);
+  assert.ok((await page.evaluate(() => window.recomp._test_files().map((f) => f.path))).some((p) => /^Data\/kits\/csk\.fsh$/i.test(p)));
+  await page.reload();
+  await page.waitForSelector('#view-home:not(.hidden)');
+  assert.match(await page.textContent('#go-patches'), /\(1\)/);
+  await page.click('#go-patches');
+  await removeLastPatch(page, 'IPL 4 Patch');
+  assert.deepStrictEqual(await gameFolder(page), { ...original, '.installed.json': (await gameFolder(page))['.installed.json'] });
+  assert.ok(!(DOCS + 'IPL4_TCF.ros/roster.dat' in await savedFiles(page)), 'roster left behind');
+  assert.strictEqual(await markerVersion(page), version0);
+});
+
+test('patches: install from a .zip with a wrapper folder', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  const zip = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'c07-pz-')), 'CWC 2011.zip');
+  require('child_process').execFileSync('python3', ['-I', '-c', `
+import zipfile, sys
+with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
+    z.writestr('CWC 2011 v2/Data/data.gob', 'BIGF world cup archive ' * 500)
+    z.writestr('CWC 2011 v2/Data/Stadiums/wankhede.o', 'stadium model')
+    z.writestr('CWC 2011 v2/Data/', '')
+`, zip]);
+  const plan = await installPatch(page, '#patch-zip', zip);
+  assert.match(plan, /CWC 2011/);
+  assert.match(plan, /2 files for the game folder, 1 of them replacing/);
+  const after = await gameFolder(page);
+  assert.strictEqual(after['Data/data.gob'], 'BIGF world cup archive '.repeat(500));
+  assert.strictEqual(after['Data/Stadiums/wankhede.o'], 'stadium model');
+});
+
+test('patches: stacked patches come off newest first', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  const original = await gameFolder(page);
+  await installPatch(page, '#patch-folder', makePatch('A', { 'Data/data.gob': 'A archive', 'Data/a.fsh': 'A texture' }));
+  const afterA = await gameFolder(page);
+  await installPatch(page, '#patch-folder', makePatch('B', { 'Data/data.gob': 'B archive', 'Data/a.fsh': 'B texture', 'Data/b.fsh': 'B only' }));
+  assert.strictEqual((await gameFolder(page))['Data/a.fsh'], 'B texture');
+  await removeLastPatch(page, 'B');
+  const back = await gameFolder(page);
+  assert.strictEqual(back['Data/data.gob'], 'A archive');
+  assert.strictEqual(back['Data/a.fsh'], 'A texture');
+  assert.ok(!('Data/b.fsh' in back));
+  assert.strictEqual(back['.installed.json'], afterA['.installed.json'], 'version after removing B should match A alone');
+  await removeLastPatch(page, 'A');
+  const clean = await gameFolder(page);
+  delete clean['.installed.json'];
+  delete original['.installed.json'];
+  assert.deepStrictEqual(clean, original);
+});
+
+test('patches: refuses programs and explains rosters before the first start', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  let plan = await planPatch(page, '#patch-folder', makePatch('Ultimate EXE', { 'Cricket 07_Launcher.exe': 'MZ', 'binkw32.dll': 'MZ', 'tool.bat': 'echo' }));
+  assert.match(plan, /Skipped 3 files/);
+  assert.match(plan, /Programs are never installed/);
+  assert.ok(await page.isDisabled('#patch-install'));
+  plan = await planPatch(page, '#patch-folder', makePatch('IPL roster', { 'IPL4_TCF.ros/roster.dat': 'roster' }));
+  assert.match(plan, /start the game once and save/);
+  assert.ok(await page.isDisabled('#patch-install'));
+  plan = await planPatch(page, '#patch-folder', makePatch('Bundle', { 'kits.rar': 'Rar!', 'Data/x.fsh': 'ok' }));
+  assert.match(plan, /kits\.rar \(an archive inside the patch: unpack it first\)/);
+});
+
+test('online: players need the same patches', async ({ browser, base, netplay }) => {
+  const patch = makePatch('IPL 4', { 'Data/data.gob': 'IPL archive', 'Data/kit.fsh': 'kit' });
+  const q = `netplay=${encodeURIComponent(netplay)}`;
+  const host = await player(browser, base + '?' + q, 'host');
+  await install(host);
+  await installPatch(host, '#patch-folder', patch);
+  await host.click('[data-go="home"]');
+  await host.click('#go-online');
+  await host.click('#np-host');
+  await host.waitForSelector('#view-lobby:not(.hidden)');
+  const code = (await host.textContent('#np-room')).trim();
+  const guest = await player(browser, `${base}?join=${code}&${q}`, 'guest');
+  await install(guest);
+  await guest.click('#np-join');
+  await host.waitForFunction(() => /Has different game files or patches/.test(document.getElementById('np-players').textContent));
+  assert.ok(await host.isDisabled('#np-start'));
+  assert.match(await host.textContent('#np-lobbymsg'), /need the same patches/);
+  // the guest installs the same patch and comes back
+  await guest.goto(`${base}?${q}`);
+  await guest.waitForSelector('#view-home:not(.hidden)');
+  await installPatch(guest, '#patch-folder', patch);
+  await guest.goto(`${base}?join=${code}&${q}`);
+  await guest.waitForSelector('#view-online:not(.hidden)');
+  await guest.click('#np-join');
+  await host.waitForFunction(() => document.querySelectorAll('#np-players li').length === 2 &&
+    !/different game files/.test(document.getElementById('np-players').textContent) && !document.getElementById('np-start').disabled);
+}, { online: true });
+
 test('online: two players stay in lockstep', async ({ browser, base, netplay }) => {
   const q = `?netplay=${encodeURIComponent(netplay)}`;
   const host = await player(browser, base + q, 'host');

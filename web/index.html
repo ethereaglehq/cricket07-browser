@@ -98,6 +98,18 @@
   .linkish:hover { color: var(--fg); }
   .saves p { margin: 0; }
   .saves .warn { color: #f2c48d; }
+  .home-links { margin-top: 12px; display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
+
+  /* patches: install from a folder or .zip, the plan before installing, the installed list */
+  #view-patches .card p { margin: 0 0 10px; }
+  #view-patches .row { flex-wrap: wrap; }
+  #patch-plan ul, #patch-list { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 6px; font-size: 14px; }
+  #patch-list li { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 10px; background: var(--field); }
+  #patch-list li .who { flex: 1; min-width: 0; }
+  #patch-list li small { display: block; color: var(--faint); }
+  #patch-plan .warn, #patch-msg.warn { color: #f2c48d; }
+  #view-patches code { font-size: 12px; padding: 1px 5px; border-radius: 5px; background: var(--field); }
+  .players .who small.warn { display: block; color: #f2c48d; }
 
   /* lobby */
   .code { font: 800 clamp(30px, 6vw, 42px)/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .18em; margin: 6px 0 2px; }
@@ -236,9 +248,48 @@
           <p id="saves-note" class="small">The game keeps only what you save in <b>My Cricket → Load / Save</b>.</p>
           <p id="saves-msg" class="small hidden"></p>
         </div>
+        <div class="home-links"><button id="go-patches" class="btn ghost slim">Patches &amp; rosters</button></div>
         <p class="small" style="margin-top:22px">Use a controller, or the keyboard: arrows to move, S to select.<br>
           Fullscreen: <kbd>Alt</kbd> + <kbd>Enter</kbd> (<kbd>⌥</kbd> + <kbd>Enter</kbd> on Mac) or the button in the corner.</p>
         <p class="small"><a href="#" id="reset">Use a different game folder</a></p>
+      </section>
+
+      <!-- patches and rosters (patches.js) -->
+      <section id="view-patches" class="view hidden">
+        <button class="back" data-go="home">← Back</button>
+        <div class="stack">
+          <div>
+            <h2 style="margin:0;font-size:24px">Patches &amp; rosters</h2>
+            <p class="small" style="margin:4px 0 0">Fan-made kits, faces, stadiums, overlays, bat packs and rosters, added to your copy of the game.</p>
+          </div>
+          <div class="card">
+            <h2>Install a patch or roster</h2>
+            <p class="small">Choose the patch's folder or .zip, with its files laid out as in the game folder (Data, Audio…).
+              Rosters (<code>.ros</code>) in it go to the game's saves by themselves.</p>
+            <div class="row">
+              <label class="btn slim">Choose folder<input id="patch-folder" type="file" webkitdirectory multiple hidden></label>
+              <label class="btn ghost slim">Choose .zip<input id="patch-zip" type="file" accept=".zip,application/zip" hidden></label>
+            </div>
+            <details>
+              <summary>The patch is a Windows installer (.exe)?</summary>
+              <p class="small" style="margin-top:8px">Don't run it: unpack it and choose the unpacked folder. Most patch installers unpack with
+                <b>The Unarchiver</b> or <code>innoextract</code> on a Mac (<code>brew install innoextract</code>, then
+                <code>innoextract setup.exe</code>), or <b>7-Zip</b> on Windows. Only game data is ever installed here: programs
+                (<code>.exe</code>, <code>.dll</code>) are always skipped, so patches that replace the game's program can't work in the browser.</p>
+            </details>
+          </div>
+          <div id="patch-plan" class="card hidden">
+            <h2 id="patch-plan-name"></h2>
+            <ul id="patch-plan-lines"></ul>
+            <div class="row"><button id="patch-install" class="btn slim">Install</button><button id="patch-cancel" class="btn ghost slim">Cancel</button></div>
+          </div>
+          <div class="card">
+            <h2>Installed</h2>
+            <ul id="patch-list"></ul>
+            <p class="small" style="margin:0">Patches come off newest first. For online play, both players need the same patches.</p>
+          </div>
+          <p id="patch-msg" class="msg"></p>
+        </div>
       </section>
 
       <!-- multiplayer: host or join -->
@@ -350,6 +401,7 @@
 <script src="netplay.js"></script>
 <script src="zip.js"></script>
 <script src="saves.js"></script>
+<script src="patches.js"></script>
 <script src="loader.js"></script>
 </body>
 </html>

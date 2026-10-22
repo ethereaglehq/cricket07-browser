@@ -60,6 +60,7 @@ async function importFromPicker(fileList) {
   if (!list.some((e) => e.dest.toLowerCase().endsWith('.exe'))) throw new Error('No .exe in that folder.');
   const root = await navigator.storage.getDirectory();
   try { await root.removeEntry(OPFS_DIR, { recursive: true }); } catch {}
+  await patches.forget();   // patches belonged to the folder copied before
   await navigator.storage.persist?.();
   const dir = await gameDir(true);
   const total = list.reduce((s, e) => s + e.f.size, 0);
@@ -367,6 +368,7 @@ async function boot() {
     if (params.has('autoplay')) $('play').click();
   };
   setupSaves();
+  setupPatches();
   $('play').onclick = () => run().catch(fail);
   $('go-online').onclick = goOnline;
   for (const b of document.querySelectorAll('[data-go]')) b.onclick = () => show(b.dataset.go);
@@ -534,6 +536,99 @@ function setupSaves() {
   };
 }
 
+// ------------------------------------------------------------------ patches and rosters (patches.js)
+
+const patches = RcPatches.open({ game: OPFS_DIR, saves: USER_DIR, store: 'rcpatches', marker: MARKER });
+
+function patchMsg(text, warn) {
+  $('patch-msg').textContent = text;
+  $('patch-msg').classList.toggle('warn', !!warn);
+}
+
+async function showPatches() {
+  const list = await patches.list().catch(() => []);
+  const ul = $('patch-list');
+  ul.innerHTML = '';
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  if (!list.length) ul.append(el('li', null, 'None yet: the game is as it came.'));
+  list.forEach((p, i) => {
+    const li = el('li');
+    const who = el('div', 'who');
+    who.append(el('b', null, p.name), el('small', null,
+      `${p.files.length} file${p.files.length === 1 ? '' : 's'} · ${new Date(p.at).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}`));
+    li.append(who);
+    if (i === list.length - 1) {
+      const b = el('button', 'btn ghost slim', 'Remove');
+      b.onclick = () => removePatch(p);
+      li.append(b);
+    }
+    ul.append(li);
+  });
+  $('go-patches').textContent = list.length ? `Patches & rosters (${list.length})` : 'Patches & rosters';
+}
+
+let pendingPlan = null;
+async function planPatch(source, name) {
+  $('patch-plan').classList.add('hidden');
+  patchMsg('Checking the patch…');
+  try { pendingPlan = await patches.plan(source, name); }
+  catch (e) { patchMsg(e.message, true); return; }
+  const p = pendingPlan, lines = [];
+  const files = (n) => `${n} file${n === 1 ? '' : 's'}`;
+  const size = p.bytes < 1e6 ? `${Math.max(1, Math.round(p.bytes / 1e3))} KB` : `${mb(p.bytes)} MB`;
+  if (p.game.length) lines.push([`${files(p.game.length)} for the game folder, ${p.replaces ? `${p.replaces} of them replacing the game's own` : 'all new'} (${size}).`]);
+  if (p.rosters.length) lines.push([`${files(p.rosters.length)} of rosters, for the game's saves.`]);
+  const shown = p.refused.slice(0, 4).map((r) => `${r.path} (${r.why})`).join(', ');
+  if (p.refused.length) lines.push([`Skipped ${files(p.refused.length)}: ${shown}${p.refused.length > 4 ? ` and ${p.refused.length - 4} more` : ''}.`, 'warn']);
+  if (p.refused.some((r) => r.why === 'a program')) lines.push(['Programs are never installed. If this patch needs its own game program, it may not work here.', 'warn']);
+  if (p.refused.some((r) => r.why.startsWith('a roster'))) lines.push(['To add its rosters, start the game once and save (My Cricket → Load / Save), then install this again.', 'warn']);
+  if (p.game.length && !p.known && !p.replaces) lines.push(['None of these files go into the game\'s Data or Audio folders. Check that you chose the folder laid out like the game folder.', 'warn']);
+  $('patch-plan-name').textContent = p.name;
+  $('patch-plan-lines').innerHTML = '';
+  for (const [text, cls] of lines) { const li = document.createElement('li'); li.textContent = text; if (cls) li.className = cls; $('patch-plan-lines').append(li); }
+  $('patch-install').disabled = !p.game.length && !p.rosters.length;
+  $('patch-plan').classList.remove('hidden');
+  patchMsg('');
+}
+
+async function removePatch(p) {
+  if (!confirm(`Remove “${p.name}”? The game files it replaced are put back.`)) return;
+  try {
+    await patches.uninstallLast(({ done, total }) => patchMsg(`Removing… ${done} of ${total}`));
+    patchMsg(`Removed “${p.name}”.`);
+  } catch (e) { patchMsg(e.message, true); }
+  showPatches();
+}
+
+function setupPatches() {
+  $('go-patches').onclick = () => { show('patches'); patchMsg(''); showPatches(); };
+  $('patch-folder').onchange = (e) => {
+    const files = e.target.files;
+    if (files.length) planPatch({ files }, files[0].webkitRelativePath.split('/')[0]);
+    e.target.value = '';
+  };
+  $('patch-zip').onchange = (e) => {
+    const f = e.target.files[0];
+    if (f) planPatch({ zip: f }, f.name.replace(/\.zip$/i, ''));
+    e.target.value = '';
+  };
+  $('patch-cancel').onclick = () => { pendingPlan = null; $('patch-plan').classList.add('hidden'); };
+  $('patch-install').onclick = async () => {
+    const p = pendingPlan;
+    if (!p) return;
+    $('patch-install').disabled = true;
+    try {
+      await patches.install(p, ({ done, total, file }) => patchMsg(`Installing ${done} of ${total}${file ? `: ${file}` : ''}`));
+      $('patch-plan').classList.add('hidden');
+      patchMsg(`Installed “${p.name}”. It shows the next time the game starts.`);
+    } catch (e) { patchMsg(`Not installed: ${e.message}`, true); }
+    $('patch-install').disabled = false;
+    pendingPlan = null;
+    showPatches();
+  };
+  showPatches();
+}
+
 // ------------------------------------------------------------------ online lobby
 
 async function buildVersion() {
@@ -593,6 +688,8 @@ function setupOnline() {
         $('np-players').innerHTML = '';
         const mine = l.players.find((p) => p.slot === l.you);
         const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+        // the same build and game files, patches included, or the two games would part ways
+        const differs = l.players.filter((p) => p.slot !== l.you && p.version && p.version !== version);
         for (const p of l.players) {
           const li = el('li');
           const direct = p.slot === l.you ? 0 : Math.max(mine?.p2p?.[p.slot] || 0, p.p2p?.[l.you] || 0);
@@ -600,6 +697,7 @@ function setupOnline() {
             : direct ? `Direct connection · ${direct} ms` : 'Connected through the room';
           const who = el('div', 'who');
           who.append(el('b', null, p.name), el('small', null, link));
+          if (differs.includes(p)) who.append(el('small', 'warn', 'Has different game files or patches'));
           li.append(el('div', 'avatar', (p.name || '?').trim().charAt(0).toUpperCase() || '?'), who);
           if (p.slot === 0) li.append(el('span', 'tag', 'Host'));
           if (p.slot === l.you) li.append(el('span', 'tag', 'You'));
@@ -611,8 +709,10 @@ function setupOnline() {
           $('np-players').appendChild(li);
         }
         $('np-hostctl').classList.toggle('hidden', !l.host);
-        $('np-start').disabled = l.players.length !== 2;
+        $('np-start').disabled = l.players.length !== 2 || differs.length > 0;
         if (l.players.length > 2) msg('This is a 1v1 game: only two players can be in the room.');
+        else if (differs.length) msg('You need the same patches to play each other: compare Patches & rosters on both computers, then both reload.');
+        else if ($('np-lobbymsg').textContent.startsWith('You need the same patches')) msg('');
         lastPlayers = l.players;
         const auto = RcNetplay.autoDelay(l.players);
         $('np-delay').options[0].textContent = `Auto (${auto} frames, ${Math.round(auto * 1000 / 60)} ms)`;

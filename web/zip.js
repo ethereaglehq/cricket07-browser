@@ -115,16 +115,36 @@
       if (path.endsWith('/')) continue;   // a folder entry
       if (flags & 1) throw bad(`${path} is encrypted`);
       if (method !== 0 && method !== 8) throw bad(`${path} uses an unsupported compression method`);
+      const dataStart = async () => {
+        const lh = new DataView(await blob.slice(at, at + 30).arrayBuffer());
+        if (lh.getUint32(0, true) !== 0x04034b50) throw bad(`damaged entry ${path}`);
+        return at + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+      };
       out.push({
-        path, size,
+        path, size, crc,
         async read() {
-          const lh = new DataView(await blob.slice(at, at + 30).arrayBuffer());
-          if (lh.getUint32(0, true) !== 0x04034b50) throw bad(`damaged entry ${path}`);
-          const start = at + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+          const start = await dataStart();
           const packed = new Uint8Array(await blob.slice(start, start + csize).arrayBuffer());
           const data = method === 0 ? packed : await inflate(packed, size).catch(() => { throw bad(`${path} is damaged`); });
           if (data.length !== size || crc32(data) !== crc) throw bad(`${path} is damaged (size or checksum mismatch)`);
           return data;
+        },
+        // The data as a stream, for big files (a patch's data.gob): checked against the size and CRC-32 as it
+        // flows, so a consumer piping it into a file sees an error, not a silently damaged copy.
+        async stream() {
+          const start = await dataStart();
+          let s = blob.slice(start, start + csize).stream();
+          if (method === 8) s = s.pipeThrough(new DecompressionStream('deflate-raw'));
+          let n = 0, sum = 0;
+          return s.pipeThrough(new TransformStream({
+            transform(chunk, ctl) {
+              n += chunk.length;
+              if (n > size) { ctl.error(bad(`${path} is damaged`)); return; }
+              sum = crc32(chunk, sum);
+              ctl.enqueue(chunk);
+            },
+            flush(ctl) { if (n !== size || sum !== crc) ctl.error(bad(`${path} is damaged (size or checksum mismatch)`)); },
+          }));
         },
       });
     }
