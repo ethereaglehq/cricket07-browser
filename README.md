@@ -76,6 +76,12 @@ node tests/web/run.js          # all tests; the online ones start the room serve
 node tests/web/run.js patches  # only tests whose name contains "patches"
 ```
 
+They also run on GitHub on every push (`.github/workflows/web-tests.yml`). To click through it yourself, run
+`node tests/web/server.js`, open http://localhost:8017 and choose a stand-in game folder: any folder with a
+`game.exe`, e.g. `mkdir -p "Fake 07/Data" && touch "Fake 07/game.exe" "Fake 07/Data/data.gob"`. For online
+play also start the room server (`cd server && npx wrangler dev --var NETPLAY_SECRET:test`) and open
+`http://localhost:8017/?netplay=http://localhost:8787` in two browser profiles (each has its own storage).
+
 ## Technical notes
 
 - **Memory keeps its original layout.** The executable is loaded at its original address, so every
