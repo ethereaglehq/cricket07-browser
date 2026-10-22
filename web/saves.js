@@ -221,7 +221,19 @@
       last, noteDownload, zipName };
   }
 
-  const api = { open, safePath, MANIFEST };
+  // Online: the host's saves, as exportZip made them, unpacked into a match's fresh saves folder. Every
+  // player does this with the same bytes, so every game starts from the same saves (lockstep needs that).
+  async function unpack(bytes, dirName) {
+    const entries = (await RcZip.read(new Blob([bytes]))).filter((e) => e.path !== MANIFEST);
+    if (entries.some((e) => !safePath(e.path)) || entries.reduce((s, e) => s + e.size, 0) > MAX_TOTAL) throw new Error('The saves bundle is not usable.');
+    const top = await navigator.storage.getDirectory();
+    await removeDir(top, dirName);
+    const dir = await top.getDirectoryHandle(dirName, { create: true });
+    for (const e of entries.sort((a, b) => (a.path < b.path ? -1 : 1))) await writeAt(dir, e.path, await e.read());
+    return entries.length;
+  }
+
+  const api = { open, unpack, safePath, MANIFEST };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.RcSaves = api;
 })(typeof self !== 'undefined' ? self : this);

@@ -280,8 +280,11 @@ function showNetStatus(M, session) {
 async function run(session) {
   $('panel').classList.add('hidden');
   fullscreenTip();
-  if (session) await clearNetSaves(session);
-  else {
+  if (session) {
+    await clearNetSaves(session);
+    // the saves the host brought: every game unpacks the same bytes, so all start alike
+    if (session.filesBytes) await RcSaves.unpack(session.filesBytes, netSaves(session));
+  } else {
     // Ask again for persistent storage, so the browser doesn't evict the saves: Chrome grants it silently
     // once the site is bookmarked or used often, so a later visit can succeed where the first didn't.
     navigator.storage.persist?.().catch(() => {});
@@ -650,6 +653,7 @@ function setupOnline() {
   if (params.get('join')) $('np-code').value = params.get('join').toUpperCase();
   let client = null;
   let lastPlayers = [];
+  let bringChecked = false;   // the host's saves summary for "Bring my saves", looked up once
 
   // create: the host's first connection, which places the room in `region` (the Worker's location hint)
   async function enter(code, create) {
@@ -680,6 +684,9 @@ function setupOnline() {
     const me = client = RcNetplay.connect({
       url, name, version, reconnectUrl: roomUrl, iceServers, relayOnly: params.get('turn') === 'only',
       onReconnect(state) { if (session) session.reconnecting = state === 'connecting'; },
+      onFiles(done, size, ok) {
+        msg(ok ? 'The host’s saves arrived: this match starts from them.' : `Receiving the host’s saves… ${Math.round(done * 100)}%`);
+      },
       onLobby(l) {
         if (client !== me) return;   // a room this page already left
         if (l.started) { msg('That game has already started.'); leave(); return; }
@@ -709,6 +716,14 @@ function setupOnline() {
           $('np-players').appendChild(li);
         }
         $('np-hostctl').classList.toggle('hidden', !l.host);
+        if (l.host && !bringChecked) {
+          bringChecked = true;
+          saves.summary().then((s) => {
+            $('np-bring').disabled = !s.files;
+            if (!s.files) $('np-bring').checked = false;
+            $('np-bring-info').textContent = s.files ? `(${s.files} file${s.files === 1 ? '' : 's'})` : '(you have none yet)';
+          });
+        }
         $('np-start').disabled = l.players.length !== 2 || differs.length > 0;
         if (l.players.length > 2) msg('This is a 1v1 game: only two players can be in the room.');
         else if (differs.length) msg('You need the same patches to play each other: compare Patches & rosters on both computers, then both reload.');
@@ -748,9 +763,26 @@ function setupOnline() {
     if (!/^[A-Z0-9]{4,12}$/.test(code)) { msg('Enter the room code from the host.'); return; }
     enter(code).catch((e) => msg(e.message));
   };
-  $('np-start').onclick = () => {
+  $('np-start').onclick = async () => {
     const v = $('np-delay').value;
-    client?.start(v === 'auto' ? RcNetplay.autoDelay(lastPlayers) : Number(v));
+    const delay = v === 'auto' ? RcNetplay.autoDelay(lastPlayers) : Number(v);
+    let files = null;
+    if ($('np-bring').checked && !$('np-bring').disabled) {
+      // Online games start from empty saves so that every game is the same; bringing the host's saves keeps
+      // that true by sending them to everyone first.
+      $('np-start').disabled = true;
+      try {
+        const bytes = new Uint8Array(await (await saves.exportZip()).arrayBuffer());
+        files = await client.offerFiles(bytes, (f) => msg(`Sending your saves… ${Math.round(f * 100)}%`));
+        msg('');
+      } catch (e) {
+        msg(`Couldn't send your saves: ${e.message}. Untick “Bring my saves” to play without them.`);
+        $('np-start').disabled = false;
+        return;
+      }
+    }
+    client?.start(delay, files);
+    $('np-start').disabled = false;
   };
 }
 

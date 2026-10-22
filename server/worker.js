@@ -151,7 +151,10 @@ export class NetplayRoom {
       if (versions.size > 1) { this.send(ws, { t: 'error', msg: 'Players have different game builds, files or patches: everyone needs the same ones, then a reload.' }); return; }
       const slots = peers.map((p) => p.slot).sort((a, b) => a - b);
       if (slots.some((s, i) => s !== i)) { this.send(ws, { t: 'error', msg: 'Waiting for the player list to settle; try again.' }); return; }
-      const started = { players: peers.length, delay: Math.max(2, Math.min(30, Number(msg.delay) || 6)) };
+      // the saves the host brought (relayed below, before the start): every game starts from them
+      const f = msg.files;
+      const files = f && /^[0-9a-f]{16}$/.test(f.id) && /^[0-9a-f]{64}$/.test(f.hash) ? { id: f.id, hash: f.hash, size: Number(f.size) || 0 } : null;
+      const started = { players: peers.length, delay: Math.max(2, Math.min(30, Number(msg.delay) || 6)), ...(files ? { files } : {}) };
       await this.ctx.storage.put('started', started);
       for (const p of peers) this.send(p.ws, { t: 'start', ...started, you: p.slot });
       return;
@@ -165,6 +168,15 @@ export class NetplayRoom {
       for (const [k, v] of Object.entries(msg.rtt || {})) p2p[Number(k)] = Math.max(0, Math.min(5000, Math.round(Number(v) || 0)));
       ws.serializeAttachment({ ...me, p2p });
       if (!(await this.ctx.storage.get('started'))) await this.lobby();
+      return;
+    }
+    // the saves the host brings to the match, in chunks, before the start; each player confirms to the host
+    if ((msg.t === 'files' || msg.t === 'chunk') && me.slot === 0 && !(await this.ctx.storage.get('started'))) {
+      for (const p of this.peers()) if (p.slot !== me.slot) try { p.ws.send(data); } catch { /* closed */ }
+      return;
+    }
+    if (msg.t === 'files-ok' && me.slot > 0) {
+      for (const p of this.peers()) if (p.slot === 0) this.send(p.ws, { t: 'files-ok', from: me.slot, id: String(msg.id || ''), hash: String(msg.hash || '') });
       return;
     }
     if (msg.t === 'in') {   // relay as-is to everyone else

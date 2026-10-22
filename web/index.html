@@ -110,6 +110,9 @@
   #patch-plan .warn, #patch-msg.warn { color: #f2c48d; }
   #view-patches code { font-size: 12px; padding: 1px 5px; border-radius: 5px; background: var(--field); }
   .players .who small.warn { display: block; color: #f2c48d; }
+  .bring { display: flex; gap: 10px; align-items: flex-start; margin: 0 0 12px; text-align: left; font-size: 13px; color: var(--muted); cursor: pointer; }
+  .bring input { margin: 2px 0 0; accent-color: var(--accent); }
+  .bring small { color: var(--faint); }
 
   /* lobby */
   .code { font: 800 clamp(30px, 6vw, 42px)/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .18em; margin: 6px 0 2px; }
@@ -347,6 +350,8 @@
           </div>
           <ul class="players" id="np-players"></ul>
           <div id="np-hostctl" class="hidden">
+            <label class="bring"><input type="checkbox" id="np-bring" checked>
+              <span>Bring my saves to this match: rosters and settings, for both players <small id="np-bring-info"></small></span></label>
             <button id="np-start" class="btn" style="width:100%">Start match</button>
             <details>
               <summary>Input delay</summary>

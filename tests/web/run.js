@@ -397,6 +397,55 @@ test('online: players need the same patches', async ({ browser, base, netplay })
     !/different game files/.test(document.getElementById('np-players').textContent) && !document.getElementById('np-start').disabled);
 }, { online: true });
 
+// ---- saves in online matches (netplay.js offerFiles, saves.js unpack)
+
+// host and guest in one room; the host has played solo (saves) and added a roster
+async function roomWithSaves(browser, base, netplay) {
+  const q = `netplay=${encodeURIComponent(netplay)}`;
+  const host = await player(browser, base + '?' + q, 'host');
+  await install(host);
+  await playAndSave(host, 2);
+  await installPatch(host, '#patch-folder', makePatch('IPL roster', { 'IPL4_TCF.ros/roster.dat': 'IPL 4 roster' }));
+  await host.click('[data-go="home"]');
+  await host.click('#go-online');
+  await host.click('#np-host');
+  await host.waitForSelector('#view-lobby:not(.hidden)');
+  const code = (await host.textContent('#np-room')).trim();
+  const guest = await player(browser, `${base}?join=${code}&${q}`, 'guest');
+  await install(guest);
+  await guest.click('#np-join');
+  await host.waitForFunction(() => !document.getElementById('np-start').disabled && /\(\d+ files\)/.test(document.getElementById('np-bring-info').textContent));
+  return { host, guest };
+}
+const savesAtStart = (page) => page.evaluate(() => window.recomp._test_saves_at_start().map((f) => `${f.path}:${f.size}`).sort());
+
+test('online: the host brings their saves and rosters to the match', async ({ browser, base, netplay }) => {
+  const { host, guest } = await roomWithSaves(browser, base, netplay);
+  assert.ok(await host.isChecked('#np-bring'));
+  await host.click('#np-start');
+  await guest.waitForFunction(() => window.recomp?._test_info);
+  await Promise.all([waitFrames(host, 200, 30000), waitFrames(guest, 200, 30000)]);
+  const [a, b] = [await savesAtStart(host), await savesAtStart(guest)];
+  assert.deepStrictEqual(b, a, 'the two games started from different saves');
+  for (const want of [DOCS + 'IPL4_TCF.ros/roster.dat', DOCS + 'Saves/save-1.sav', DOCS + 'Settings.dat'])
+    assert.ok(a.some((f) => f.startsWith(want + ':')), `${want} missing: ${a.join(', ')}`);
+  assert.ok(!a.some((f) => f.includes('cricket07-saves.json')));
+  const [ia, ib] = await Promise.all([host, guest].map((p) => p.evaluate(() => window.recomp._test_info())));
+  assert.strictEqual(ia.net.desync + ib.net.desync, 0, 'desync');
+  // the guest's own (solo) saves are untouched
+  assert.deepStrictEqual(await savedFiles(guest), {});
+}, { online: true });
+
+test('online: without "Bring my saves" both games start fresh', async ({ browser, base, netplay }) => {
+  const { host, guest } = await roomWithSaves(browser, base, netplay);
+  await host.uncheck('#np-bring');
+  await host.click('#np-start');
+  await guest.waitForFunction(() => window.recomp?._test_info);
+  await Promise.all([waitFrames(host, 60, 30000), waitFrames(guest, 60, 30000)]);
+  assert.deepStrictEqual(await savesAtStart(host), []);
+  assert.deepStrictEqual(await savesAtStart(guest), []);
+}, { online: true });
+
 test('online: two players stay in lockstep', async ({ browser, base, netplay }) => {
   const q = `?netplay=${encodeURIComponent(netplay)}`;
   const host = await player(browser, base + q, 'host');

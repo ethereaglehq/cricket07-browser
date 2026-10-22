@@ -900,21 +900,31 @@ W(RemoveDirectoryA) {
     RET(1, rmdir(host) == 0);
 }
 
-typedef struct { char dir[1024]; char pattern[256]; DIR *d; } FindState;
+/* A search's matches are read at once and sorted by name ignoring case, the order NTFS lists a folder
+   in. The order then doesn't depend on the browser's storage, so every online peer lists its files
+   (saves, rosters) the same way. */
+typedef struct { char dir[1024]; int n, next; char (*names)[260]; } FindState;
+
+static int find_cmp(const void *a, const void *b) {
+    const unsigned char *x = a, *y = b;
+    for (;; x++, y++) {
+        int cx = toupper(*x), cy = toupper(*y);
+        if (cx != cy || !cx) return cx - cy;
+    }
+}
 
 static int find_next(FindState *fs, uint32_t out) {
-    struct dirent *e;
-    while (fs->d && (e = readdir(fs->d))) {
-        if (fnmatch(fs->pattern, e->d_name, FNM_CASEFOLD)) continue;
+    while (fs->next < fs->n) {
+        const char *name = fs->names[fs->next++];
         char full[1300];
-        snprintf(full, sizeof full, "%s/%s", fs->dir, e->d_name);
+        snprintf(full, sizeof full, "%s/%s", fs->dir, name);
         struct stat st;
         if (stat(full, &st)) continue;
         memset(HP(out), 0, 320);  /* WIN32_FIND_DATAA */
         W32(out, S_ISDIR(st.st_mode) ? 0x10 : 0x80);
         W32(out + 28, (uint32_t)((uint64_t)st.st_size >> 32));
         W32(out + 32, (uint32_t)st.st_size);
-        snprintf((char *)HP(out + 44), 260, "%s", e->d_name);
+        snprintf((char *)HP(out + 44), 260, "%s", name);
         return 1;
     }
     return 0;
@@ -922,21 +932,32 @@ static int find_next(FindState *fs, uint32_t out) {
 
 W(FindFirstFileA) {
     const char *spec = GSTR(ARG(0));
-    char guest_dir[1024], host[1024];
+    char guest_dir[1024], host[1024], pattern[256];
     snprintf(guest_dir, sizeof guest_dir, "%s", spec);
     char *sl = strrchr(guest_dir, '\\');
     char *sl2 = strrchr(guest_dir, '/');
     if (sl2 > sl) sl = sl2;
-    FindState *fs = calloc(1, sizeof *fs);
-    if (sl) { snprintf(fs->pattern, sizeof fs->pattern, "%s", sl + 1); *sl = 0; }
-    else { snprintf(fs->pattern, sizeof fs->pattern, "%s", guest_dir); guest_dir[0] = 0; }
-    if (!strcmp(fs->pattern, "*.*")) strcpy(fs->pattern, "*");
+    if (sl) { snprintf(pattern, sizeof pattern, "%s", sl + 1); *sl = 0; }
+    else { snprintf(pattern, sizeof pattern, "%s", guest_dir); guest_dir[0] = 0; }
+    if (!strcmp(pattern, "*.*")) strcpy(pattern, "*");
     map_path(guest_dir[0] ? guest_dir : ".", host, sizeof host);
+    FindState *fs = calloc(1, sizeof *fs);
     snprintf(fs->dir, sizeof fs->dir, "%s", host);
-    fs->d = opendir(host);
-    LOG("[file] FindFirstFileA(%s) in %s\n", spec, host);
+    DIR *d = opendir(host);
+    if (d) {
+        struct dirent *e;
+        int cap = 0;
+        while ((e = readdir(d))) {
+            if (fnmatch(pattern, e->d_name, FNM_CASEFOLD)) continue;
+            if (fs->n == cap) { cap = cap ? cap * 2 : 32; fs->names = realloc(fs->names, (size_t)cap * sizeof *fs->names); }
+            snprintf(fs->names[fs->n++], 260, "%s", e->d_name);
+        }
+        closedir(d);
+        qsort(fs->names, (size_t)fs->n, sizeof *fs->names, find_cmp);
+    }
+    LOG("[file] FindFirstFileA(%s) in %s: %d\n", spec, host, fs->n);
     if (!find_next(fs, ARG(1))) {
-        if (fs->d) closedir(fs->d);
+        free(fs->names);
         free(fs);
         set_error(ERROR_FILE_NOT_FOUND);
         RET(2, 0xFFFFFFFFu);
@@ -952,7 +973,7 @@ W(FindNextFileA) {
 }
 W(FindClose) {
     WinHandle *x = handle_get(ARG(0), H_FIND);
-    if (x && x->ptr) { FindState *fs = x->ptr; if (fs->d) closedir(fs->d); }
+    if (x && x->ptr) { FindState *fs = x->ptr; free(fs->names); fs->names = NULL; }   /* handle_close frees fs */
     handle_close(ARG(0));
     RET(1, 1);
 }

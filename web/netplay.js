@@ -24,6 +24,14 @@
   // jitter counts) and reported, so the lobby can pick an input delay that covers the slowest pair of
   // players (autoDelay).
 
+  // Saves the host brings to a match travel through the room as base64 chunks (a room message holds at
+  // most 1 MB), and are checked with SHA-256 on arrival.
+  const CHUNK = 192 * 1024;
+  const MAX_FILES = 32 << 20;
+  const b64e = (u8) => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+  const b64d = (s) => Uint8Array.from(atob(s), (ch) => ch.charCodeAt(0));
+  const sha256 = async (u8) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', u8))].map((b) => b.toString(16).padStart(2, '0')).join('');
+
   // Round-trip samples over one path, summarised as a 90th percentile.
   function trip() {
     const samples = [];
@@ -52,6 +60,9 @@
     let rtt = 0, reported = 0;   // round trip to the room (90th percentile), and the value the room last heard
     const peers = new Map();  // slot -> { pc, dc, trip, rtt }
     const p2pReported = {};
+    // the host's saves for the match (offerFiles): what each player has received, and who confirmed it
+    const incoming = new Map(), received = new Map(), acks = new Map();
+    let offered = null, lobby = null;
     const send = (m) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); };
     const ping = setInterval(() => {
       // in a game, a room connection that has gone quiet (pongs come 4 times a second) is dead even if the
@@ -166,13 +177,43 @@
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'lobby') {
         me = m.you;
+        lobby = m;
         if (webrtc) {
           const present = new Set(m.players.map((p) => p.slot));
           for (const [slot, p] of peers) if (!present.has(slot)) { p.pc.close(); peers.delete(slot); }
           for (const p of m.players) if (p.slot > me) peer(p.slot);
         }
         opts.onLobby?.(m);
-      } else if (m.t === 'start') { started = true; opts.onStart?.(m); }
+      } else if (m.t === 'start') {
+        started = true;
+        // the saves every game starts from: the host's own copy, or what this player received and checked
+        if (m.files) m.filesBytes = offered?.id === m.files.id ? offered.bytes : received.get(m.files.id) || null;
+        if (m.files && !m.filesBytes) opts.onError?.('The host\'s saves did not arrive; this match starts without them.');
+        opts.onStart?.(m);
+      }
+      else if (m.t === 'files' && m.size <= MAX_FILES) {
+        incoming.set(m.id, { hash: m.hash, size: m.size, parts: new Array(m.n), got: 0 });
+        opts.onFiles?.(0, m.size);
+      } else if (m.t === 'chunk') {
+        const f = incoming.get(m.id);
+        if (!f || f.parts[m.k] || !(m.k >= 0 && m.k < f.parts.length)) return;
+        f.parts[m.k] = b64d(m.data);
+        opts.onFiles?.(++f.got / f.parts.length, f.size);
+        if (f.got === f.parts.length) {
+          incoming.delete(m.id);
+          const damaged = () => opts.onError?.('The host\'s saves arrived damaged; ask them to start again.');
+          if (f.parts.reduce((s, part) => s + part.length, 0) !== f.size) { damaged(); return; }
+          const bytes = new Uint8Array(f.size);
+          let at = 0;
+          for (const part of f.parts) { bytes.set(part, at); at += part.length; }
+          sha256(bytes).then((h) => {
+            if (h !== f.hash) { damaged(); return; }
+            received.set(m.id, bytes);
+            send({ t: 'files-ok', id: m.id, hash: h });
+            opts.onFiles?.(1, f.size, true);
+          });
+        }
+      } else if (m.t === 'files-ok') acks.get(m.id)?.add(m.from);
       else if (m.t === 'rejoined') {   // back in the game: resend what may have been lost
         for (const text of history) ws.send(text);
         opts.onReconnect?.('rejoined');
@@ -212,7 +253,29 @@
     open(opts.url, false);
 
     return {
-      start(delay) { send({ t: 'start', delay }); },
+      // files: what offerFiles resolved to, so every game starts from the host's saves
+      start(delay, files) { send({ t: 'start', delay, ...(files ? { files } : {}) }); },
+      // Host: sends `bytes` (the saves to bring) to every other player in the room and resolves once each
+      // has received and checked them: { id, hash, size } for start(). onProgress(fraction sent).
+      async offerFiles(bytes, onProgress) {
+        if (bytes.length > MAX_FILES) throw new Error(`too big to send (${Math.round(bytes.length / 1e6)} MB)`);
+        const hash = await sha256(bytes), id = hash.slice(0, 16), n = Math.max(1, Math.ceil(bytes.length / CHUNK));
+        offered = { id, hash, size: bytes.length, bytes };
+        acks.set(id, new Set());
+        send({ t: 'files', id, hash, size: bytes.length, n });
+        for (let k = 0; k < n; k++) {
+          send({ t: 'chunk', id, k, data: b64e(bytes.subarray(k * CHUNK, (k + 1) * CHUNK)) });
+          onProgress?.((k + 1) / n);
+          while (ws && ws.readyState === 1 && ws.bufferedAmount > 1 << 20) await new Promise((r) => setTimeout(r, 20));
+        }
+        const others = () => (lobby?.players || []).filter((p) => p.slot !== me).map((p) => p.slot);
+        for (const t0 = Date.now(); ;) {
+          if (others().every((s) => acks.get(id).has(s))) return { id, hash, size: bytes.length };
+          if (Date.now() - t0 > 60000) throw new Error('your friend did not receive them in time');
+          if (!ws || ws.readyState !== 1) throw new Error('the connection to the room dropped');
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      },
       // Hooks a running game up to the room (after it was started with the session's settings).
       // The game thread kicks the pump as soon as it queues a message (host/netplay.c); the timer is a
       // safety net.
