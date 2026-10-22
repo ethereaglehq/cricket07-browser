@@ -566,7 +566,8 @@ function diagnostics() {
   const memory = engine?.M.wasmMemory?.buffer.byteLength;
   return [
     'Cricket 07 diagnostics', `when: ${new Date().toISOString()}`, `page: ${location.origin}${location.pathname}`,
-    `URL options: ${location.search || '(none)'}`,
+    // without the room code and room server: a report gets passed around, and the code would let anyone into the match
+    `URL options: ${[...new URLSearchParams(location.search)].map(([k, v]) => (k === 'join' || k === 'netplay' ? `${k}=…` : v ? `${k}=${v}` : k)).join(' ') || '(none)'}`,
     `browser: ${navigator.userAgent}`,
     ...(ua ? [`platform: ${ua.platform || '?'}${ua.mobile ? ' (mobile)' : ''}; ${ua.brands.map((b) => `${b.brand} ${b.version}`).join(', ')}`] : []),
     `display: ${screen.width}x${screen.height} at ${devicePixelRatio}x, canvas ${canvas.width}x${canvas.height}, ` +

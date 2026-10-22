@@ -44,6 +44,9 @@
 
   const FRAME_MS = 1000 / 60;
   const NO_SLACK = -2147483648;      // netplay_remote_input: a repeat, or an input it can't time
+  const MAX_SLOTS = 4;               // players in a room (server/worker.js MAX_PLAYERS, host/netplay.c NP_SLOTS)
+  const EARLY_MAX = 2048;            // inputs and hashes kept for a game not attached yet: far more than a
+                                     // peer sends before it waits for ours
   const PERIODS = 16, MIN_PERIODS = 8;   // reports cover 4 s of quarter-seconds, once 2 s of them had inputs
   const MARGIN_MS = 4;               // slack a raise leaves
   const SPARE_MS = 6;                // and more on top before lowering, so a lower lead doesn't flap back up
@@ -97,8 +100,9 @@
     const REPEAT = 8;
     let game = null;          // the Emscripten module once attached
     let timer = null;
-    let me = -1;
-    const early = [];         // input batches that arrive before the game is attached
+    let me = -1, players = 0;   // our slot, and the number of players once the game starts
+    const early = [];         // input batches that arrive before the game is attached (checked: see checkIn)
+    let earlyN = 0;
     const roomTrip = trip();
     let rtt = 0, reported = 0;   // round trip to the room (90th percentile), and the value the room last heard
     const peers = new Map();  // slot -> { pc, dc, trip, rtt, via }
@@ -176,7 +180,12 @@
 
     function onMessage(m, from) {
       if (from && opts.testLoss && Math.random() < opts.testLoss) return;
-      if (m.t === 'in') { if (game) deliver(game, m); else early.push(m); }
+      if (m.t === 'in') {
+        const c = checkIn(m, from);
+        if (!c) return;
+        if (game) deliver(game, c);
+        else if ((earlyN += c.d.length + c.h.length + 1) <= EARLY_MAX) early.push(c);
+      }
       else if (m.t === 'ping' && from) from.dc.send(JSON.stringify({ t: 'pong', ts: m.ts }));
       else if (m.t === 'pong') {
         const ms = Date.now() - m.ts;
@@ -195,7 +204,7 @@
       let p = peers.get(slot);
       if (p) return p;
       const pc = new RTCPeerConnection({ iceServers: opts.iceServers || [], iceTransportPolicy: opts.relayOnly ? 'relay' : 'all' });
-      p = { pc, dc: null, trip: trip(), rtt: 0, via: '' };
+      p = { slot, pc, dc: null, trip: trip(), rtt: 0, via: '' };
       peers.set(slot, p);
       const use = (dc) => {
         p.dc = dc;
@@ -244,12 +253,13 @@
         if (webrtc) {
           const present = new Set(m.players.map((p) => p.slot));
           for (const [slot, p] of peers) if (!present.has(slot)) { p.pc.close(); peers.delete(slot); }
-          for (const p of m.players) if (p.slot > me) peer(p.slot);
+          for (const p of m.players) if (slotOk(p.slot) && p.slot > me) peer(p.slot);
         }
         opts.onLobby?.(m);
       } else if (m.t === 'start') {
         started = true;
         startDelay = m.delay;
+        players = Number.isInteger(m.players) && m.players >= 1 && m.players <= MAX_SLOTS ? m.players : 0;
         // the saves every game starts from: the host's own copy, or what this player received and checked
         if (m.files) m.filesBytes = offered?.id === m.files.id ? offered.bytes : received.get(m.files.id) || null;
         if (m.files && !m.filesBytes) {
@@ -303,16 +313,37 @@
         opts.onReconnect?.('rejoined');
       }
       else if (m.t === 'error') opts.onError?.(m.msg);
-      else if (m.t === 'sig' && webrtc) onSignal(m.from, m.data).catch((e) => console.warn('webrtc:', e));
-      else if (m.t === 'left') { gone.add(m.slot); if (game) game._netplay_player_left(m.slot); opts.onLeft?.(m.slot); }
+      else if (m.t === 'sig' && webrtc && slotOk(m.from) && m.from !== me) onSignal(m.from, m.data).catch((e) => console.warn('webrtc:', e));
+      else if (m.t === 'left' && slotOk(m.slot)) { gone.add(m.slot); if (game) game._netplay_player_left(m.slot); opts.onLeft?.(m.slot); }
       else onMessage(m, null);
     }
 
-    function deliver(M, m) {
+    // An 'in' message, checked and copied: inputs and hashes only for the other players' slots (over a direct
+    // channel, only the sender's own), frames and a lead in range, and a lag report from a player of this game,
+    // within a second. The game reads a slot as a 32-bit integer, so 1 + 2^32 would pass there as player 1:
+    // unchecked, a hostile peer or room server could make this page keep, time and report on any number of
+    // players. Null before our game starts: the room's copy of any input comes after its start message.
+    function checkIn(m, from) {
+      if (!players) return null;
+      const ok = (s) => Number.isInteger(s) && s >= 0 && s < players && s !== me && (!from || s === from.slot);
+      const frame = (f) => Number.isInteger(f) && f >= 0 && f <= 0x7fffffff;
+      const d = [], h = [];
+      if (Array.isArray(m.d)) for (const v of m.d) {
+        if (!Array.isArray(v) || !ok(v[0]) || !frame(v[1])) continue;
+        const lead = Number.isInteger(v[8]) && v[8] >= 1 && v[8] <= 60 ? v[8] : 0;
+        d.push([v[0], v[1], v[2] | 0, v[3] | 0, v[4] | 0, v[5] | 0, v[6] | 0, v[7] >>> 0, lead]);
+      }
+      if (Array.isArray(m.h)) for (const v of m.h) if (Array.isArray(v) && ok(v[0]) && frame(v[1])) h.push([v[0], v[1], v[2] >>> 0, v[3] >>> 0]);
+      const said = ok(m.by) && m.lag ? m.lag[me] : undefined;   // the sender's report on our inputs
+      return Number.isFinite(said) ? { d, h, by: m.by, lag: Math.max(-1000, Math.min(1000, said)) } : { d, h, by: -1, lag: 0 };
+    }
+    const slotOk = (s) => Number.isInteger(s) && s >= 0 && s < MAX_SLOTS;
+
+    function deliver(M, c) {
       const now = performance.now();
-      for (const [s, f, b, lx, ly, rx, ry, dt, lead] of m.d || []) {
-        const slack = M._netplay_remote_input(s, f, b, lx, ly, rx, ry, dt >>> 0);
-        if (!(lead > 0)) continue;   // an older peer, or an input not to time (host/netplay.c)
+      for (const [s, f, b, lx, ly, rx, ry, dt, lead] of c.d) {
+        const slack = M._netplay_remote_input(s, f, b, lx, ly, rx, ry, dt);
+        if (!lead) continue;   // an older peer, or an input not to time (host/netplay.c)
         if (f > (leads.get(s)?.[0] || 0)) leads.set(s, [f, lead]);
         if (typeof slack !== 'number' || slack === NO_SLACK) continue;   // a repeat, or an older build
         const lag = lead * FRAME_MS - slack;
@@ -321,9 +352,8 @@
         const q = lags.get(s);
         q.worst = Math.max(q.worst, lag);
       }
-      for (const [s, f, lo, hi] of m.h || []) M._netplay_remote_hash(s, f, lo, hi);
-      const said = m.lag?.[me];   // the sender's report on our inputs
-      if (Number.isInteger(m.by) && Number.isFinite(said)) reports.set(m.by, { lag: said, at: now });
+      for (const [s, f, lo, hi] of c.h) M._netplay_remote_hash(s, f, lo, hi);
+      if (c.by >= 0) reports.set(c.by, { lag: c.lag, at: now });
     }
 
     // Every 250 ms: our report on each player's inputs, then our lead from theirs on ours.

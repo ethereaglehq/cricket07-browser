@@ -480,6 +480,75 @@ test('netplay: a hostile host or room server cannot flood a guest with save chun
   delete global.WebSocket;
 });
 
+test('netplay: hostile input messages are checked before the game or the input delay sees them', async () => {
+  const sockets = [];
+  global.WebSocket = class { constructor(url) { this.url = url; this.readyState = 1; this.bufferedAmount = 0; this.sent = []; sockets.push(this); setTimeout(() => this.onopen?.(), 0); }
+    send(t) { this.sent.push(t); } close() { this.readyState = 3; } };
+  const np = require('../../web/netplay.js');
+  const left = [];
+  const c = np.connect({ url: 'ws://test', name: 'host', version: 'v', onLobby() {}, onStart() {}, onLeft: (s) => left.push(s) });
+  await sleep(10);
+  const ws = sockets[0], say = (m) => ws.onmessage({ data: JSON.stringify(m) });
+  const input = (s, f, lead = 4) => [s, f, 0, 0, 0, 0, 0, 16667, lead];   // slot, frame, buttons, axes, frame time, lead
+  say({ t: 'lobby', you: 0, host: true, players: [{ slot: 0 }, { slot: 1 }] });
+  say({ t: 'in', d: [input(1, 999999)] });   // before the start: nothing is due yet
+  say({ t: 'start', players: 2, delay: 4, you: 0 });
+  // before the game is attached: kept for it, but only so many
+  for (let k = 0; k < 100; k++) say({ t: 'in', d: Array.from({ length: 50 }, (_, i) => input(1, 1 + k * 50 + i)) });
+  const seen = [], hashes = [], delays = [];
+  const M = {
+    _netplay_remote_input: (s, f) => { seen.push([s, f]); return 0; },
+    _netplay_remote_hash: (s) => hashes.push(s),
+    _netplay_player_left() {},
+    _netplay_set_delay: (n) => delays.push(n),
+    _netplay_status: () => 0,
+    _netplay_pop: () => 0,
+    _netplay_msg: () => 0,
+  };
+  c.attach(M, 2 ** 31 - 1);
+  assert.ok(seen.length > 1000 && seen.length <= 2048, `${seen.length} early inputs kept`);
+  assert.ok(!seen.some(([, f]) => f === 999999), 'an input from before the start reached the game');
+  seen.length = 0;
+  // the game reads slots as 32-bit integers: aliases of player 1, our own slot and slots no game has never reach it
+  say({ t: 'in', d: [input(1 + 2 ** 32, 1), input('1', 2), input(1.5, 3), input(-1, 4), input(0, 5), input(2, 6), input(1, -1), input(1, 2 ** 40), input(1, 7)],
+    h: [[1 + 2 ** 32, 60, 1, 2], [3, 60, 1, 2], [1, 60, 1, 2]] });
+  assert.deepStrictEqual(seen, [[1, 7]]);
+  assert.deepStrictEqual(hashes, [1]);
+  // a lag report from an alias of player 1 is ignored; player 1's own is capped at a second (the 30-frame ceiling)
+  say({ t: 'in', d: [], by: 1 + 2 ** 32, lag: { 0: 1e9 } });
+  await sleep(600);
+  assert.deepStrictEqual(delays, []);
+  say({ t: 'in', d: [], by: 1, lag: { 0: 1e9 } });
+  await sleep(600);
+  assert.deepStrictEqual(delays, [30]);
+  say({ t: 'left', slot: 1 + 2 ** 32 });
+  say({ t: 'left', slot: 1 });
+  assert.deepStrictEqual(left, [1]);
+  c.close();
+  delete global.WebSocket;
+});
+
+test('serve.py: only the page and the build, only to this computer, no listings', async () => {
+  const port = 9100 + Math.floor(Math.random() * 800);
+  const proc = spawn('python3', [path.join(ROOT, 'web', 'serve.py'), '--port', String(port)]);
+  const get = (p, host = `localhost:${port}`) => new Promise((resolve, reject) => {
+    require('http').get({ host: '127.0.0.1', port, path: p, headers: { host } }, (r) => { r.resume(); resolve(r.statusCode); }).on('error', reject);
+  });
+  try {
+    for (let i = 0; i < 50; i++) { try { await get('/'); break; } catch { await sleep(100); } }
+    assert.strictEqual(await get('/'), 200);
+    assert.strictEqual(await get('/loader.js'), 200);
+    const secret = path.join(ROOT, 'README.md');
+    for (const p of ['/build/' + secret, '/build//etc/passwd', '/../README.md', '/..%2fREADME.md', '/%2e%2e/README.md',
+      '/build/..%2f..%2fREADME.md', '/..\\README.md', '/build/', '/fake-dir/'])
+      assert.strictEqual(await get(p), 404, p);
+    // a web page that points a name of its own at this computer (DNS rebinding) gets nothing
+    assert.strictEqual(await get('/', 'evil.example'), 404);
+    assert.strictEqual(await get('/', 'localhost.evil.example'), 404);
+    assert.strictEqual(await get('/', `127.0.0.1:${port}`), 200);
+  } finally { proc.kill(); }
+});
+
 test('zip: an entry claiming a huge size is not allocated up front', async () => {
   // a few KB of deflated zeros that declare 900 MB when unpacked
   const zip = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'c07-big-')), 'claims.zip');
@@ -787,7 +856,7 @@ test('stops: the watchdog offers Restart and diagnostics when frames stop, and g
   await page.waitForFunction(() => document.getElementById('halt-report').value);
   const report = await page.inputValue('#halt-report');
   for (const want of [/^browser: .*Chrome/m, /^WebGPU adapter: /m, /^wasm memory: \d+ MB/m, /^frames presented: \d+, the last/m,
-    /^URL options: \?watchdog=2&fps$/m, /^game: running \(not responding\), solo/m, /^\[mem\] guest heap \d+ MB/m,
+    /^URL options: watchdog=2 fps$/m, /^game: running \(not responding\), solo/m, /^\[mem\] guest heap \d+ MB/m,
     /^\[fake\] started/m])
     assert.match(report, want);
   if (/Copied/.test(await page.textContent('#halt-copy')))
@@ -826,6 +895,12 @@ test('online: the watchdog waits for the other player, and flags a stuck game', 
   await guest.evaluate(() => window.recomp._test_hang());   // the guest's game freezes; the host waits for its input
   await guest.waitForSelector('#halt:not(.hidden)', { timeout: 8000 });
   assert.match(await guest.textContent('#halt-title'), /isn’t responding/);
+  // its diagnostics leave out the room code (a way into the match) and the room server
+  await guest.evaluate(() => { document.getElementById('halt-more').open = true; });
+  await guest.waitForFunction(() => document.getElementById('halt-report').value);
+  const report = await guest.inputValue('#halt-report'), code = new URL(guest.url()).searchParams.get('join');
+  assert.match(report, /^URL options: join=… netplay=… watchdog=2$/m);
+  assert.ok(code && !report.includes(code), 'the room code is in the diagnostics');
   await sleep(3000);
   assert.ok(await host.evaluate(() => window.recomp._netplay_status(4)), 'the host is not waiting for input');
   assert.ok(!await haltShown(host), 'the host, waiting for the other player, got the overlay');
