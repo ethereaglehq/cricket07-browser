@@ -14,8 +14,9 @@
 //              the connection as it goes)
 //
 // Online play (netplay.js, host/netplay.c): players meet in a room on the server; when the host starts,
-// every page boots the game in deterministic lockstep mode with fresh saves, and only pad inputs travel.
-// Each player's keyboard and first gamepad merge into one local pad; mouse and raw keys are off.
+// every page boots the game in deterministic lockstep mode with fresh saves (or the host's), and only inputs
+// travel. Each player's keyboard and first gamepad merge into one local pad; the mouse is shared (both players
+// move the one cursor the game draws); raw keys are off.
 'use strict';
 
 const $ = (id) => document.getElementById(id);
@@ -101,7 +102,7 @@ Object.assign(HID, {
 for (let i = 1; i <= 12; i++) HID['F' + i] = 57 + i;
 for (let i = 1; i <= 9; i++) HID['Numpad' + i] = 88 + i;
 
-// Netplay: the keyboard drives this player's pad (the game itself gets no keys or mouse, which would desync).
+// Netplay: the keyboard drives this player's pad (the game itself gets no keys, which would desync).
 // Bit 4 is LB, which the game sees as L1: its modifier for lofted shots (the in-game tutorial: "L1 + shot
 // button" to hit a six; on the keyboard that's Shift), so Shift holds it as well as Q. The game pauses only
 // on the keyboard's Esc, not the pad's Start, so Esc is bit 20: host/netplay.c applies it to the DirectInput
@@ -131,29 +132,41 @@ function hookInput(M, net) {
     window.addEventListener('keydown', key(true));
     window.addEventListener('keyup', key(false));
     window.addEventListener('blur', () => { netKeyBits = 0; if (!engineDead) pollLocalPad(M); });
-    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-    return;
+  } else {
+    const key = (down) => (e) => {
+      const u = HID[e.code];
+      if (u === undefined || e.repeat || pressOff(down)) return;
+      if (!haltMode && !(e.metaKey && !down)) e.preventDefault();
+      M._input_key_hid(u, down ? 1 : 0);
+    };
+    window.addEventListener('keydown', key(true));
+    window.addEventListener('keyup', key(false));
   }
-  const key = (down) => (e) => {
-    const u = HID[e.code];
-    if (u === undefined || e.repeat || pressOff(down)) return;
-    if (!haltMode && !(e.metaKey && !down)) e.preventDefault();
-    M._input_key_hid(u, down ? 1 : 0);
-  };
-  window.addEventListener('keydown', key(true));
-  window.addEventListener('keyup', key(false));
   // The game draws its own cursor and reads relative motion. Lock the pointer when the browser allows
   // it (then the system cursor can't leave the game); without a lock, motion over the canvas still works.
+  // Online too: host/netplay.c carries the mouse with the inputs, so either player can work the screens the
+  // PC version leaves to the mouse (Innings Highlights' CONTINUE).
+  // Chrome's first movement around the moment the pointer locks (or unlocks) is a leap across the page, not the
+  // mouse's, and it can come just before the change or just after: it would throw the cursor into a corner at
+  // the first click. Movement is ignored from the request until a tenth of a second after the change (or a third
+  // of a second after the request, if no change comes).
+  let quietUntil = 0;
+  const quiet = (ms) => { quietUntil = performance.now() + ms; };
+  document.addEventListener('pointerlockchange', () => quiet(100));
   canvas.addEventListener('mousedown', (e) => {
     if (pressOff(true)) return;
-    if (document.pointerLockElement !== canvas) {
-      const p = canvas.requestPointerLock?.();
+    if (document.pointerLockElement !== canvas && canvas.requestPointerLock) {
+      quiet(300);
+      const p = canvas.requestPointerLock();
       if (p && p.catch) p.catch(() => {});
     }
     M._input_mouse_button([0, 2, 1][e.button] ?? 0, 1);
   });
   window.addEventListener('mouseup', (e) => { if (!engineDead) M._input_mouse_button([0, 2, 1][e.button] ?? 0, 0); });
-  canvas.addEventListener('mousemove', (e) => { if (!pressOff(true)) M._input_mouse_move(e.movementX, e.movementY); });
+  canvas.addEventListener('mousemove', (e) => {
+    if (performance.now() < quietUntil || pressOff(true)) return;
+    M._input_mouse_move(e.movementX, e.movementY);
+  });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 

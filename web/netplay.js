@@ -331,7 +331,7 @@
       if (Array.isArray(m.d)) for (const v of m.d) {
         if (!Array.isArray(v) || !ok(v[0]) || !frame(v[1])) continue;
         const lead = Number.isInteger(v[8]) && v[8] >= 1 && v[8] <= 60 ? v[8] : 0;
-        d.push([v[0], v[1], v[2] | 0, v[3] | 0, v[4] | 0, v[5] | 0, v[6] | 0, v[7] >>> 0, lead]);
+        d.push([v[0], v[1], v[2] | 0, v[3] | 0, v[4] | 0, v[5] | 0, v[6] | 0, v[7] >>> 0, lead, v[9] | 0]);
       }
       if (Array.isArray(m.h)) for (const v of m.h) if (Array.isArray(v) && ok(v[0]) && frame(v[1])) h.push([v[0], v[1], v[2] >>> 0, v[3] >>> 0]);
       const said = ok(m.by) && m.lag ? m.lag[me] : undefined;   // the sender's report on our inputs
@@ -341,8 +341,8 @@
 
     function deliver(M, c) {
       const now = performance.now();
-      for (const [s, f, b, lx, ly, rx, ry, dt, lead] of c.d) {
-        const slack = M._netplay_remote_input(s, f, b, lx, ly, rx, ry, dt);
+      for (const [s, f, b, lx, ly, rx, ry, dt, lead, mouse] of c.d) {
+        const slack = M._netplay_remote_input(s, f, b, lx, ly, rx, ry, dt, mouse);
         if (!lead) continue;   // an older peer, or an input not to time (host/netplay.c)
         if (f > (leads.get(s)?.[0] || 0)) leads.set(s, [f, lead]);
         if (typeof slack !== 'number' || slack === NO_SLACK) continue;   // a repeat, or an older build
@@ -388,9 +388,10 @@
       const d = [], h = [];
       while (game._netplay_pop()) {
         const v = [];
-        for (let i = 0; i < 10; i++) v.push(game._netplay_msg(i));
-        // input: slot, frame, buttons, axes, frame time (us), lead (frames ahead it went out; 0: don't time it)
-        if (v[0] === 1) d.push([...v.slice(1, 8), v[8] >>> 0, v[9]]);
+        for (let i = 0; i < 11; i++) v.push(game._netplay_msg(i));
+        // input: slot, frame, buttons (and mouse buttons), axes, frame time (us), lead (frames ahead it went out;
+        // 0: don't time it), mouse movement (x in the low 16 bits, y in the high 16)
+        if (v[0] === 1) d.push([...v.slice(1, 8), v[8] >>> 0, v[9], v[10]]);
         else if (v[0] === 2) h.push([v[1], v[2], v[8] >>> 0, v[9] >>> 0]);   // hash: slot, frame, lo, hi
       }
       if (!d.length && !h.length) return;

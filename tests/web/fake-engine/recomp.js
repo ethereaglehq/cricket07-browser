@@ -56,12 +56,17 @@ async function createRecomp(opts) {
   // ---- netplay: the lockstep of host/netplay.c
   const net = ENV.RC_NETPLAY && ENV.RC_DETERMINISTIC ? {
     players: Number(ENV.RC_NP_PLAYERS || 2), slot: Number(ENV.RC_NP_SLOT || 0), delay: Number(ENV.RC_NP_DELAY || 4),
-    warmup: Number(ENV.RC_NP_DELAY || 4), lastSent: 0, inputs: [], left: [], out: [], popped: Array(10).fill(0),
+    warmup: Number(ENV.RC_NP_DELAY || 4), lastSent: 0, inputs: [], left: [], out: [], popped: Array(11).fill(0),
     myHash: new Map(), theirHash: [], desync: 0, waitMs: 0, stalls: 0, waitingSince: 0, ranAt: 0,
   } : null;
   const FRAME_MS = 1000 / 60, NO_SLACK = -2147483648;
   if (net) for (let s = 0; s < 4; s++) { net.inputs.push(new Map()); net.left.push(false); net.theirHash.push(new Map()); }
   let local = { buttons: 0, axis: [0, 0, 0, 0] }, pressed = 0;
+  // the mouse: online, like host/netplay.c, everyone's movement moves the one cursor and a button is down while
+  // anyone holds it (mouse: movement and buttons not sent yet); the cursor and its clicks are game state
+  const mouse = { dx: 0, dy: 0, held: 0, pressed: 0 }, cursor = { x: 320, y: 240, down: 0, clicks: 0 };
+  const moveCursor = (dx, dy) => { cursor.x = Math.max(0, Math.min(639, cursor.x + dx)); cursor.y = Math.max(0, Math.min(479, cursor.y + dy)); };
+  const pressCursor = (b) => { if (b & 1 & ~cursor.down) cursor.clicks++; cursor.down = b; };
   const pads = [];
   let frame = 0, hashLo = 0x811c9dc5, hashHi = 0x01000193, hung = false;
   const mix = (v) => {
@@ -81,17 +86,20 @@ async function createRecomp(opts) {
     if (!net) return;
     const target = frame + net.delay;
     if (target > net.lastSent) {
-      const buttons = local.buttons | pressed;
-      pressed = 0;
-      for (let f = Math.max(net.lastSent + 1, net.warmup + 1); f <= target; f++) {
-        net.inputs[net.slot].set(f, { buttons, axis: [...local.axis] });
-        push([1, net.slot, f, buttons, ...local.axis, net.slot === 0 ? 16667 : 0, f - frame]);
+      const buttons = (local.buttons | pressed | (mouse.held | mouse.pressed) << 21) >>> 0;
+      const moved = (mouse.dx & 0xffff) | (mouse.dy << 16);
+      pressed = mouse.pressed = mouse.dx = mouse.dy = 0;
+      const first = Math.max(net.lastSent + 1, net.warmup + 1);
+      for (let f = first; f <= target; f++) {
+        const m = f === first ? moved : 0;   // the movement once
+        net.inputs[net.slot].set(f, { buttons, axis: [...local.axis], mouse: m });
+        push([1, net.slot, f, buttons, ...local.axis, net.slot === 0 ? 16667 : 0, f - frame, m]);
       }
       net.lastSent = target;
     }
     if (frame % 60 === 0) {
       net.myHash.set(frame, [hashLo, hashHi]);
-      push([2, net.slot, frame, 0, 0, 0, 0, 0, hashLo, hashHi]);
+      push([2, net.slot, frame, 0, 0, 0, 0, 0, hashLo, hashHi, 0]);
       for (let s = 0; s < net.players; s++) check(s, frame);
     }
   }
@@ -119,12 +127,17 @@ async function createRecomp(opts) {
         if (waited > 10) net.stalls++;
         net.waitingSince = 0;
       }
+      let mx = 0, my = 0, mb = 0;
       for (let s = 0; s < net.players; s++) {
         const e = next > net.warmup && !net.left[s] && net.inputs[s].get(next);
         mix(e ? e.buttons : 0);
         for (const a of e ? e.axis : [0, 0, 0, 0]) mix(a);
+        if (e) { mx += (e.mouse << 16) >> 16; my += e.mouse >> 16; mb |= (e.buttons >>> 21) & 7; }
         net.inputs[s].delete(next - 512);
       }
+      moveCursor(mx, my);
+      pressCursor(mb);
+      mix(cursor.x); mix(cursor.y); mix(cursor.clicks);
       net.ranAt = performance.now();
     } else for (const p of pads) mix(p.buttons);
     frame = next;
@@ -150,6 +163,9 @@ async function createRecomp(opts) {
     ctx.fillText(`Stand-in engine · frame ${frame}`, 20, c.height / 8);
     ctx.fillText(net ? `online · player ${net.slot + 1} · delay ${net.delay}` : 'solo', 20, c.height / 8 * 2);
     ctx.fillText(`${gameFiles.length} game files · state ${hashLo.toString(16)}`, 20, c.height / 8 * 3);
+    ctx.fillText(`mouse clicks ${cursor.clicks}`, 20, c.height / 8 * 4);
+    const x = cursor.x * c.width / 640, y = cursor.y * c.height / 480, r = c.height / 40;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + 2 * r); ctx.lineTo(x + 1.3 * r, y + 1.4 * r); ctx.closePath(); ctx.fill();
   }
 
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
@@ -178,8 +194,15 @@ async function createRecomp(opts) {
       // S in solo play: the game writes a save (its Load / Save screen)
       if (usage === 22 && down && !net) M._test_save(`Saves/save-${++saveCount}.sav`, `save ${saveCount} at frame ${frame}\n`);
     },
-    _input_mouse_button() {},
-    _input_mouse_move() {},
+    _input_mouse_button(b, down) {
+      if (b < 0 || b > 2) return;
+      if (net) { if (down) { mouse.held |= 1 << b; mouse.pressed |= 1 << b; } else mouse.held &= ~(1 << b); }
+      else pressCursor(down ? cursor.down | 1 << b : cursor.down & ~(1 << b));
+    },
+    _input_mouse_move(dx, dy) {
+      if (net) { mouse.dx = Math.max(-32768, Math.min(32767, mouse.dx + dx)); mouse.dy = Math.max(-32768, Math.min(32767, mouse.dy + dy)); }
+      else moveCursor(dx, dy);
+    },
     _input_gamepad(idx, connected, buttons, lx, ly, rx, ry) {
       if (net) {
         if (idx !== 0) return;
@@ -192,13 +215,13 @@ async function createRecomp(opts) {
       net.popped = net.out.shift();
       return 1;
     },
-    _netplay_msg: (i) => (net && i >= 0 && i < 10 ? net.popped[i] | 0 : 0),
+    _netplay_msg: (i) => (net && i >= 0 && i < 11 ? net.popped[i] | 0 : 0),
     // Like host/netplay.c: how early the input came (ms before it's needed, negative if the stand-in was already
     // waiting for it), or NO_SLACK for a repeat or a frame already played. The stand-in runs a frame per
     // animation frame, so it needs frame + 1 at the first one after the last frame it ran.
-    _netplay_remote_input(s, f, b, lx, ly, rx, ry) {
+    _netplay_remote_input(s, f, b, lx, ly, rx, ry, dt, mouse = 0) {
       if (!net || s < 0 || s >= net.players || s === net.slot || net.inputs[s].has(f) || f <= frame) return NO_SLACK;
-      net.inputs[s].set(f, { buttons: b, axis: [lx, ly, rx, ry] });
+      net.inputs[s].set(f, { buttons: b, axis: [lx, ly, rx, ry], mouse: mouse | 0 });
       if (!frame) return NO_SLACK;
       const now = performance.now();
       const need = (net.waitingSince || Math.max(now, net.ranAt + FRAME_MS)) + (f - frame - 1) * FRAME_MS;
@@ -227,6 +250,7 @@ async function createRecomp(opts) {
       setTimeout(() => { throw new WebAssembly.RuntimeError(message); });
     },
     _test_throw_pump(n = 1) { throwPumps = n; },
+    _test_mouse: () => ({ ...cursor, frame }),
     _test_info: () => ({ frame, pumps, keys, hash: [hashLo, hashHi], net: net && { slot: net.slot, delay: net.delay, stalls: net.stalls, desync: net.desync, lastSent: net.lastSent } }),
   };
   return M;

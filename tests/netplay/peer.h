@@ -1,5 +1,5 @@
 /* Forced include (-include, see run.sh) for building host/netplay.c once per simulated player: everything it
- * defines, and the callbacks it calls (getenv for its settings, the pad and key it applies), gets the player's
+ * defines, and the callbacks it calls (getenv for its settings, the pad, key and mouse it applies), gets the player's
  * prefix (p0_, p1_), so two copies with their own globals link into one program. */
 #define NP_CAT2(a, b) a##b
 #define NP_CAT(a, b) NP_CAT2(a, b)
@@ -8,6 +8,8 @@
 #define netplay_on NP_PEER(netplay_on)
 #define netplay_frame_dt_us NP_PEER(netplay_frame_dt_us)
 #define netplay_local_pad NP_PEER(netplay_local_pad)
+#define netplay_local_mouse_move NP_PEER(netplay_local_mouse_move)
+#define netplay_local_mouse_button NP_PEER(netplay_local_mouse_button)
 #define netplay_frame NP_PEER(netplay_frame)
 #define netplay_pop NP_PEER(netplay_pop)
 #define netplay_msg NP_PEER(netplay_msg)
@@ -19,3 +21,5 @@
 #define getenv NP_PEER(getenv)
 #define dinput_pad NP_PEER(dinput_pad)
 #define input_key_usage_sync NP_PEER(input_key_usage_sync)
+#define dinput_mouse_move NP_PEER(dinput_mouse_move)
+#define input_mouse_button_sync NP_PEER(input_mouse_button_sync)

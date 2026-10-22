@@ -14,11 +14,13 @@
 void dinput_key(uint8_t dik, int down);
 void dinput_mouse_button(int b, int down);
 void dinput_mouse_move(int dx, int dy);
-/* Netplay (netplay.c): only pads are shared between peers, so keyboard and mouse don't reach the game
-   (one peer's keys would desync the others); the page maps the keyboard onto the local pad instead. */
+/* Netplay (netplay.c): only pads and the mouse are shared between peers, so the keyboard doesn't reach the
+   game (one peer's keys would desync the others); the page maps the keyboard onto the local pad instead. */
 int netplay_on(void);
 int netplay_local_pad(int idx, int connected, uint32_t buttons, const int32_t axis[4]);
-EXPORT void input_mouse_move(int dx, int dy) { if (!netplay_on()) dinput_mouse_move(dx, dy); }
+int netplay_local_mouse_move(int dx, int dy);
+int netplay_local_mouse_button(int b, int down);
+EXPORT void input_mouse_move(int dx, int dy) { if (!netplay_local_mouse_move(dx, dy)) dinput_mouse_move(dx, dy); }
 /* Gamepads, in the W3C "standard gamepad" layout (both SDL's GameController and the browser's Gamepad API
    map onto it): buttons bit 0-16 = A B X Y, LB RB, LT RT (digital), Back Start, L3 R3, d-pad up down left
    right, Guide; axes -32768..32767 (left x/y, right x/y; +y = down). */
@@ -159,13 +161,18 @@ EXPORT void input_key_hid(int usage, int down) {
     input_key_usage_sync(usage, down);
 }
 
-EXPORT void input_mouse_button(int b, int down) {
+/* A mouse button the lockstep applies on every peer alike (netplay.c carries the mouse with the inputs). */
+void input_mouse_button_sync(int b, int down) {
     static const uint8_t vk[3] = { 0x01, 0x02, 0x04 };  /* VK_LBUTTON, VK_RBUTTON, VK_MBUTTON */
-    if (netplay_on()) return;
     dinput_mouse_button(b, down);
     g_keys[vk[b]] = (uint8_t)down;
     static const uint32_t msg_down[3] = { 0x201, 0x204, 0x207 };
     post_message(MAIN_HWND, down ? msg_down[b] : msg_down[b] + 1, 0, 0);
+}
+
+EXPORT void input_mouse_button(int b, int down) {
+    if (b < 0 || b > 2) return;
+    if (!netplay_local_mouse_button(b, down)) input_mouse_button_sync(b, down);
 }
 
 /* Scripted input for automated testing, driven by the game's frame counter:

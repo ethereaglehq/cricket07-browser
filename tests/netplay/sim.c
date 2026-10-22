@@ -38,11 +38,13 @@
 #define PEER_API(p)                                                                                         \
     uint32_t p##_netplay_frame_dt_us(void);                                                                 \
     int p##_netplay_local_pad(int idx, int connected, uint32_t buttons, const int32_t axis[4]);            \
+    int p##_netplay_local_mouse_move(int dx, int dy);                                                       \
+    int p##_netplay_local_mouse_button(int b, int down);                                                    \
     void p##_netplay_frame(uint32_t frame, uint64_t (*state_hash)(void));                                   \
     int p##_netplay_pop(void);                                                                              \
     int32_t p##_netplay_msg(int i);                                                                         \
     int32_t p##_netplay_remote_input(int slot, uint32_t frame, uint32_t buttons, int lx, int ly, int rx, int ry, \
-                                     uint32_t dt_us);                                                       \
+                                     uint32_t dt_us, int32_t mouse);                                        \
     void p##_netplay_remote_hash(int slot, uint32_t frame, uint32_t lo, uint32_t hi);                       \
     void p##_netplay_set_delay(int frames);                                                                 \
     uint32_t p##_netplay_status(int what);
@@ -52,15 +54,18 @@ PEER_API(p1)
 typedef struct {
     uint32_t (*frame_dt_us)(void);
     int (*local_pad)(int, int, uint32_t, const int32_t[4]);
+    int (*local_mouse_move)(int, int);
+    int (*local_mouse_button)(int, int);
     void (*frame)(uint32_t, uint64_t (*)(void));
     int (*pop)(void);
     int32_t (*msg)(int);
-    int32_t (*remote_input)(int, uint32_t, uint32_t, int, int, int, int, uint32_t);
+    int32_t (*remote_input)(int, uint32_t, uint32_t, int, int, int, int, uint32_t, int32_t);
     void (*remote_hash)(int, uint32_t, uint32_t, uint32_t);
     void (*set_delay)(int);
     uint32_t (*status)(int);
 } Api;
-#define API_OF(p) { p##_netplay_frame_dt_us, p##_netplay_local_pad, p##_netplay_frame, p##_netplay_pop, p##_netplay_msg, \
+#define API_OF(p) { p##_netplay_frame_dt_us, p##_netplay_local_pad, p##_netplay_local_mouse_move,                  \
+                    p##_netplay_local_mouse_button, p##_netplay_frame, p##_netplay_pop, p##_netplay_msg,               \
                     p##_netplay_remote_input, p##_netplay_remote_hash, p##_netplay_set_delay, p##_netplay_status }
 static const Api API[2] = { API_OF(p0), API_OF(p1) };
 
@@ -141,6 +146,10 @@ typedef struct { uint32_t buttons; int32_t axis[4]; } Pad;
 static Pad g_applied[2][MAX_FRAMES][2];   /* [player][frame][slot]: the pads its netplay.c applied */
 static uint32_t g_dt[2][MAX_FRAMES];      /* [player][frame]: the frame time it used */
 static Pad g_sent[2][MAX_FRAMES];         /* [slot][frame]: the sample that slot's player sent for the frame */
+typedef struct { int32_t dx, dy; uint32_t buttons; int changed; } Mouse;
+static Mouse g_mouse_applied[2][MAX_FRAMES];   /* [player][frame]: the mouse its netplay.c applied (buttons: if changed) */
+static Mouse g_mouse_sent[2][MAX_FRAMES];      /* [slot][frame]: the mouse that slot's player sent for the frame */
+static uint32_t g_mouse_down[2];          /* each player's game: the mouse buttons down */
 static uint32_t g_applying[2];            /* the frame each player's netplay_frame is applying */
 static uint64_t g_state[2];               /* each player's game state: a hash of every pad applied (for netplay.c's desync check) */
 static volatile uint32_t g_frame[2];      /* last frame each player presented */
@@ -169,6 +178,21 @@ void p0_dinput_pad(int idx, int connected, uint32_t b, const int32_t axis[4]) { 
 void p1_dinput_pad(int idx, int connected, uint32_t b, const int32_t axis[4]) { (void)connected; apply_pad(1, idx, b, axis); }
 void p0_input_key_usage_sync(int usage, int down) { (void)usage; (void)down; }
 void p1_input_key_usage_sync(int usage, int down) { (void)usage; (void)down; }
+static void apply_mouse_move(int k, int dx, int dy) {
+    uint32_t f = g_applying[k];
+    if (f < MAX_FRAMES) { g_mouse_applied[k][f].dx += dx; g_mouse_applied[k][f].dy += dy; }
+    g_state[k] = (g_state[k] ^ ((uint32_t)dx * 31u + (uint32_t)dy)) * 0x100000001b3ull;
+}
+static void apply_mouse_button(int k, int b, int down) {
+    uint32_t f = g_applying[k];
+    if (down) g_mouse_down[k] |= 1u << b; else g_mouse_down[k] &= ~(1u << b);
+    if (f < MAX_FRAMES) { g_mouse_applied[k][f].buttons = g_mouse_down[k]; g_mouse_applied[k][f].changed = 1; }
+    g_state[k] = (g_state[k] ^ (0x1000u + g_mouse_down[k])) * 0x100000001b3ull;
+}
+void p0_dinput_mouse_move(int dx, int dy) { apply_mouse_move(0, dx, dy); }
+void p1_dinput_mouse_move(int dx, int dy) { apply_mouse_move(1, dx, dy); }
+void p0_input_mouse_button_sync(int b, int down) { apply_mouse_button(0, b, down); }
+void p1_input_mouse_button_sync(int b, int down) { apply_mouse_button(1, b, down); }
 static uint64_t hash0(void) { return g_state[0]; }
 static uint64_t hash1(void) { return g_state[1]; }
 
@@ -178,6 +202,8 @@ static void *game(void *arg) {
     double t0 = g_start + (k ? S->late + 0.009 : 0);   /* the two displays' vsyncs are 9 ms apart */
     sleep_until(t0);
     uint32_t shown = 0, held = 0, acc = 0, last_target = (uint32_t)S->delay;
+    uint32_t mouse_held = 0, mouse_acc = 0;
+    int32_t mouse_dx = 0, mouse_dy = 0;
     long vsync = 0;
     int32_t axis[4] = { 0, 0, 0, 0 };
     for (uint32_t f = 1; f <= S->frames; f++) {
@@ -194,6 +220,15 @@ static void *game(void *arg) {
         axis[3] = (int32_t)f;
         API[k].local_pad(0, 1, held, axis);
         acc |= held;
+        /* the mouse: moving now and then, a quick click, the right button held for a while */
+        if (rnd01(&rng) < 0.3) {
+            int dx = (int)(rnd(&rng) % 41) - 20, dy = (int)(rnd(&rng) % 41) - 20;
+            API[k].local_mouse_move(dx, dy);
+            mouse_dx += dx; mouse_dy += dy;
+        }
+        if (rnd01(&rng) < 0.05) { API[k].local_mouse_button(0, 1); API[k].local_mouse_button(0, 0); mouse_acc |= 1; }
+        if (rnd01(&rng) < 0.02) { mouse_held ^= 2; API[k].local_mouse_button(1, (mouse_held & 2) != 0); }
+        mouse_acc |= mouse_held;
         g_applying[k] = f + 1;
         API[k].frame(f, k ? hash1 : hash0);
         if (f + 1 < MAX_FRAMES) g_dt[k][f + 1] = API[k].frame_dt_us();
@@ -203,9 +238,12 @@ static void *game(void *arg) {
             for (uint32_t F = last_target + 1; F <= target && F < MAX_FRAMES; F++) {
                 g_sent[k][F].buttons = acc;
                 memcpy(g_sent[k][F].axis, axis, 16);
+                /* the movement goes with the first of these frames */
+                g_mouse_sent[k][F] = (Mouse){ F == last_target + 1 ? mouse_dx : 0, F == last_target + 1 ? mouse_dy : 0, mouse_acc, 0 };
             }
             last_target = target;
             acc = 0;   /* netplay.c starts its "pressed" bits again */
+            mouse_acc = 0; mouse_dx = mouse_dy = 0;
         }
         g_frame[k] = f;
         /* the display: each refresh shows the next queued frame, if there is one */
@@ -307,7 +345,7 @@ static void adapt_tick(int k, double now) {
     if (t >= MEASURE_FROM && t < MEASURE_TO && p->lead > p->max_lead) p->max_lead = p->lead;
 }
 
-typedef struct { uint32_t v[9]; } Entry;   /* an input as web/netplay.js sends it: slot, frame, buttons, axes, frame time, lead */
+typedef struct { uint32_t v[10]; } Entry;   /* an input as web/netplay.js sends it: slot, frame, buttons, axes, frame time, lead, mouse */
 typedef struct Packet {
     double at;
     int to, n, nh, has_report;
@@ -341,10 +379,10 @@ static void pump(int k, double now) {
     uint32_t h[4][4];
     int n = 0, nh = 0;
     while (API[k].pop()) {
-        uint32_t v[10];
-        for (int i = 0; i < 10; i++) v[i] = (uint32_t)API[k].msg(i);
+        uint32_t v[11];
+        for (int i = 0; i < 11; i++) v[i] = (uint32_t)API[k].msg(i);
         if (v[0] == 1 && n < 128) {
-            Entry e = { { v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9] } };
+            Entry e = { { v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10] } };
             d[n++] = e;
             if (g_nrecent[k] == REPEAT) memmove(g_recent[k], g_recent[k] + 1, sizeof(Entry) * (REPEAT - 1));
             else g_nrecent[k]++;
@@ -372,7 +410,7 @@ static void deliver(Packet *pk, double now) {
     Policy *p = &g_pol[k];
     for (int i = 0; i < pk->n; i++) {
         const uint32_t *e = pk->d[i].v;
-        int32_t slack = API[k].remote_input((int)e[0], e[1], e[2], (int)e[3], (int)e[4], (int)e[5], (int)e[6], e[7]);
+        int32_t slack = API[k].remote_input((int)e[0], e[1], e[2], (int)e[3], (int)e[4], (int)e[5], (int)e[6], e[7], (int32_t)e[9]);
         int lead = (int)e[8];
         if (lead <= 0) continue;
         if (e[1] > p->newest) { p->newest = e[1]; p->their_lead = lead; }
@@ -459,6 +497,21 @@ static int run(const Scenario *sc, FILE *out) {
                   want.buttons, want.axis[3]);
             checked++;
         }
+    }
+    /* and the same mouse: everyone's movement added up, each button down while anyone held it */
+    uint32_t down[2] = { 0, 0 };
+    for (uint32_t f = 2; f <= S->frames + 1 && f < MAX_FRAMES; f++) {
+        const Mouse *a = &g_mouse_applied[0][f], *b = &g_mouse_applied[1][f];
+        for (int k = 0; k < 2; k++) if (g_mouse_applied[k][f].changed) down[k] = g_mouse_applied[k][f].buttons;
+        CHECK(a->dx == b->dx && a->dy == b->dy && down[0] == down[1], "frame %u: the mouse %d,%d/%x on one, %d,%d/%x on the other",
+              f, a->dx, a->dy, down[0], b->dx, b->dy, down[1]);
+        Mouse want = { 0, 0, 0, 0 };
+        if (f > (uint32_t)S->delay)
+            for (int s = 0; s < 2; s++) {
+                want.dx += g_mouse_sent[s][f].dx; want.dy += g_mouse_sent[s][f].dy; want.buttons |= g_mouse_sent[s][f].buttons;
+            }
+        CHECK(a->dx == want.dx && a->dy == want.dy && down[0] == want.buttons, "frame %u: the mouse applied %d,%d/%x, sent %d,%d/%x",
+              f, a->dx, a->dy, down[0], want.dx, want.dy, want.buttons);
     }
     for (int k = 0; k < 2; k++) CHECK(API[k].status(2) == 0, "player %d's netplay.c saw a desync at frame %u", k + 1, API[k].status(2));
 

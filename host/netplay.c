@@ -6,7 +6,10 @@
  * (D = input delay) and goes into the outbox; then the game thread waits until every player's input for
  * frame f + 1 is known and applies all of them at once, before the game reads input again. Frames 1..D
  * are neutral for everyone. Physical input never reaches the game directly in netplay: input_gamepad()
- * for the local pad only updates the sample taken at the next Present.
+ * for the local pad, and input_mouse_move() / input_mouse_button() for the mouse, only update the sample
+ * taken at the next Present. The mouse is shared: everyone's movement moves the one cursor the game draws,
+ * and a button is down while anyone holds it (some of the PC version's screens only answer the mouse:
+ * without it, players were stuck on Innings Highlights between innings).
  *
  * Frame time is an input too: in deterministic mode the game's clock only moves by what Present gives it,
  * so a fixed 1/60 s per frame would make the game run in slow motion whenever the players manage fewer
@@ -43,12 +46,15 @@
 #define NP_RING 512          /* frames of input kept per player */
 #define NP_HASH_EVERY 60
 
-typedef struct { uint32_t frame; uint32_t buttons; int32_t axis[4]; uint32_t dt_us; } NpInput;   /* frame 0 = empty */
+typedef struct { uint32_t frame; uint32_t buttons; int32_t axis[4]; uint32_t dt_us; int32_t mouse; } NpInput;   /* frame 0 = empty */
 /* buttons: standard-gamepad bits 0-16, plus keys the game only takes from the keyboard (pause is Esc, not
-   Start): they travel with the pad and are applied to the DirectInput keyboard on every peer */
+   Start): they travel with the pad and are applied to the DirectInput keyboard on every peer; and the mouse
+   buttons (left, right, middle). mouse: its movement since the previous input, x in the low 16 bits and y in
+   the high 16 (both signed). */
 #define NP_PAD_BITS 0x1FFFFu
 #define NP_KEY_ESC (1u << 20)
-typedef struct { uint32_t kind, slot, frame, buttons; int32_t axis[4]; uint32_t hash_lo, hash_hi; } NpMsg;
+#define NP_MOUSE_SHIFT 21
+typedef struct { uint32_t kind, slot, frame, buttons; int32_t axis[4]; uint32_t hash_lo, hash_hi; int32_t mouse; } NpMsg;
 enum { MSG_INPUT = 1, MSG_HASH = 2 };
 
 static int g_np = -1;                       /* netplay on */
@@ -60,6 +66,8 @@ static NpInput g_in[NP_SLOTS][NP_RING];
 static int g_left[NP_SLOTS];                /* peer gone: its pad reads neutral from then on */
 static NpInput g_local;                     /* latest physical/scripted state of the local pad */
 static uint32_t g_local_pressed;            /* buttons pressed since the last sample sent (see netplay_frame) */
+static int32_t g_local_mx, g_local_my;      /* local mouse movement not sent yet */
+static uint32_t g_local_mouse, g_local_mouse_pressed;   /* local mouse buttons held, and pressed since the last sample */
 static pthread_mutex_t g_local_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define OUTBOX 1024
@@ -117,6 +125,24 @@ int netplay_local_pad(int idx, int connected, uint32_t buttons, const int32_t ax
     return 1;
 }
 
+/* input_mouse_move() and input_mouse_button() land here in netplay mode. */
+int netplay_local_mouse_move(int dx, int dy) {
+    if (!netplay_on()) return 0;
+    pthread_mutex_lock(&g_local_lock);
+    g_local_mx += dx; g_local_my += dy;
+    pthread_mutex_unlock(&g_local_lock);
+    return 1;
+}
+int netplay_local_mouse_button(int b, int down) {
+    if (!netplay_on()) return 0;
+    pthread_mutex_lock(&g_local_lock);
+    if (down) { g_local_mouse |= 1u << b; g_local_mouse_pressed |= 1u << b; }
+    else g_local_mouse &= ~(1u << b);
+    pthread_mutex_unlock(&g_local_lock);
+    return 1;
+}
+static int32_t clamp16(int32_t v) { return v < -32768 ? -32768 : v > 32767 ? 32767 : v; }
+
 static void outbox_push(const NpMsg *m) {
     uint32_t w = g_out_w;
     if (w - __atomic_load_n(&g_out_r, __ATOMIC_ACQUIRE) >= OUTBOX) { fprintf(stderr, "[netplay] outbox full\n"); return; }
@@ -137,10 +163,11 @@ static void inputs_changed(void) {
 #endif
 }
 
-static void store_input(int slot, uint32_t frame, uint32_t buttons, const int32_t axis[4], uint32_t dt_us) {
+static void store_input(int slot, uint32_t frame, uint32_t buttons, const int32_t axis[4], uint32_t dt_us, int32_t mouse) {
     NpInput *e = &g_in[slot][frame % NP_RING];
     e->buttons = buttons;
     e->dt_us = dt_us;
+    e->mouse = mouse;
     for (int i = 0; i < 4; i++) e->axis[i] = axis[i];
     __atomic_store_n(&e->frame, frame, __ATOMIC_RELEASE);
 }
@@ -195,19 +222,23 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
     static double wait_end;
     int slow = wait_end && t_present - wait_end > 0.05;
     if (target >= first) {
-        NpMsg m = { MSG_INPUT, (uint32_t)g_np_slot, 0, 0, { 0 }, dt_us, 0 };
+        NpMsg m = { MSG_INPUT, (uint32_t)g_np_slot, 0, 0, { 0 }, dt_us, 0, 0 };
         /* A button pressed and released since the last sample still counts as held for this one: the pad
            is only sampled here, once a frame, so a quick tap between two samples would otherwise be lost (and
            the slower the game runs, the more taps fall between samples). */
         pthread_mutex_lock(&g_local_lock);
-        m.buttons = g_local.buttons | g_local_pressed;
-        g_local_pressed = 0;
+        m.buttons = g_local.buttons | g_local_pressed | (g_local_mouse | g_local_mouse_pressed) << NP_MOUSE_SHIFT;
+        g_local_pressed = g_local_mouse_pressed = 0;
         for (int i = 0; i < 4; i++) m.axis[i] = g_local.axis[i];
+        int32_t mx = clamp16(g_local_mx), my = clamp16(g_local_my);
+        g_local_mx -= mx; g_local_my -= my;   /* more than fits goes with the next */
         pthread_mutex_unlock(&g_local_lock);
         for (uint32_t f = first; f <= target; f++) {
             m.frame = f;
             m.hash_hi = slow ? 0 : f - frame;
-            store_input(g_np_slot, f, m.buttons, m.axis, dt_us);
+            /* the movement once (the frames in between hold the buttons, not another move) */
+            m.mouse = f == first ? (int32_t)((uint32_t)(uint16_t)mx | (uint32_t)(uint16_t)my << 16) : 0;
+            store_input(g_np_slot, f, m.buttons, m.axis, dt_us, m.mouse);
             outbox_push(&m);
         }
         g_last_sent = target;
@@ -223,7 +254,7 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
         uint64_t h = state_hash();
         int k = (int)((frame / NP_HASH_EVERY) % NP_HASHES);
         g_my_hash[k] = h; g_my_hash_frame[k] = frame;
-        NpMsg hm = { MSG_HASH, (uint32_t)g_np_slot, frame, 0, { 0 }, (uint32_t)h, (uint32_t)(h >> 32) };
+        NpMsg hm = { MSG_HASH, (uint32_t)g_np_slot, frame, 0, { 0 }, (uint32_t)h, (uint32_t)(h >> 32), 0 };
         outbox_push(&hm);
         for (int s = 0; s < g_np_players; s++)
             if (g_pending[s][k].frame == frame) check_hash(frame, g_pending[s][k].hash, s);
@@ -265,18 +296,28 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
     static const int32_t zero[4] = { 0, 0, 0, 0 };
     extern void dinput_pad(int idx, int connected, uint32_t std_buttons, const int32_t axis[4]);
     uint32_t keys = 0;
+    int32_t mx = 0, my = 0;
     for (int s = 0; s < g_np_players; s++) {
         NpInput *e = &g_in[s][next % NP_RING];
         int live = next > (uint32_t)g_np_delay && !g_left[s] && e->frame == next;
         uint32_t b = live ? e->buttons : 0;
         keys |= b;
         dinput_pad(s, 1, b & NP_PAD_BITS, live ? e->axis : zero);
+        if (live) { mx += (int16_t)(uint16_t)e->mouse; my += (int16_t)(uint16_t)((uint32_t)e->mouse >> 16); }
     }
     /* keyboard keys carried with the inputs: either player's Esc pauses, on every peer alike */
     extern void input_key_usage_sync(int usage, int down);
     static int esc_down;
     int esc = (keys & NP_KEY_ESC) != 0;
     if (esc != esc_down) { esc_down = esc; input_key_usage_sync(41 /* HID: Escape */, esc); }
+    /* and the mouse: everyone's movement, and a button down while anyone holds it */
+    extern void dinput_mouse_move(int dx, int dy);
+    extern void input_mouse_button_sync(int b, int down);
+    static uint32_t mouse_down;
+    uint32_t mouse = keys >> NP_MOUSE_SHIFT & 7u;
+    if (mx || my) dinput_mouse_move(mx, my);
+    for (int k = 0; k < 3; k++) if ((mouse ^ mouse_down) >> k & 1u) input_mouse_button_sync(k, (int)(mouse >> k & 1u));
+    mouse_down = mouse;
     /* the frame time every peer uses for the next frame: the host's (1/60 s before inputs start or if the
        host has left) */
     NpInput *h = &g_in[0][next % NP_RING];
@@ -286,20 +327,20 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
 /* ------------------------------------------------------------------ transport side (any thread) */
 
 /* Next outgoing message: netplay_pop() loads it (0 if none), netplay_msg(i) reads its fields: kind, slot,
-   frame, buttons, axes x4, hash lo, hash hi (an input's frame time, and how many frames ahead it was sent).
-   (Fields by call, so the transport needs no view of wasm memory.) */
-static uint32_t g_popped[10];
+   frame, buttons, axes x4, hash lo, hash hi (an input's frame time, and how many frames ahead it was sent),
+   mouse movement. (Fields by call, so the transport needs no view of wasm memory.) */
+static uint32_t g_popped[11];
 EXPORT int netplay_pop(void) {
     uint32_t r = g_out_r;
     if (r == __atomic_load_n(&g_out_w, __ATOMIC_ACQUIRE)) return 0;
     NpMsg *m = &g_out[r % OUTBOX];
-    uint32_t v[10] = { m->kind, m->slot, m->frame, m->buttons, (uint32_t)m->axis[0], (uint32_t)m->axis[1],
-                       (uint32_t)m->axis[2], (uint32_t)m->axis[3], m->hash_lo, m->hash_hi };
+    uint32_t v[11] = { m->kind, m->slot, m->frame, m->buttons, (uint32_t)m->axis[0], (uint32_t)m->axis[1],
+                       (uint32_t)m->axis[2], (uint32_t)m->axis[3], m->hash_lo, m->hash_hi, (uint32_t)m->mouse };
     memcpy(g_popped, v, sizeof v);
     __atomic_store_n(&g_out_r, r + 1, __ATOMIC_RELEASE);
     return 1;
 }
-EXPORT int32_t netplay_msg(int i) { return i >= 0 && i < 10 ? (int32_t)g_popped[i] : 0; }
+EXPORT int32_t netplay_msg(int i) { return i >= 0 && i < 11 ? (int32_t)g_popped[i] : 0; }
 
 /* How early a remote input for `frame` arrives: ms before this game needs it, negative when it has already been
    waiting that long. Waiting at Present g, it has needed frame g + 1 since that Present began; past the wait it
@@ -320,12 +361,12 @@ static int32_t arrival_slack(uint32_t frame) {
 /* Returns how early the input arrived (arrival_slack), or NP_NO_SLACK if it was here already: inputs come over
    two paths, and every direct packet repeats the last few. */
 EXPORT int32_t netplay_remote_input(int slot, uint32_t frame, uint32_t buttons, int lx, int ly, int rx, int ry,
-                                    uint32_t dt_us) {
+                                    uint32_t dt_us, int32_t mouse) {
     if (!netplay_on() || slot < 0 || slot >= g_np_players || slot == g_np_slot) return NP_NO_SLACK;
     if (__atomic_load_n(&g_in[slot][frame % NP_RING].frame, __ATOMIC_ACQUIRE) == frame) return NP_NO_SLACK;
     int32_t slack = arrival_slack(frame);   /* before storing it: the game thread may take it and move on at once */
     const int32_t axis[4] = { lx, ly, rx, ry };
-    store_input(slot, frame, buttons, axis, dt_us);
+    store_input(slot, frame, buttons, axis, dt_us, mouse);
     inputs_changed();
     return slack;
 }

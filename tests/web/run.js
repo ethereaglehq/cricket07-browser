@@ -632,7 +632,8 @@ test('patches: a patch may not overwrite the page\'s own marker file', async ({ 
 
 // Host and guest meet in a room and the host starts the game. Options: query (added to both pages' URLs, or
 // one per player as [host's, guest's]), init (scripts for both pages, as for player()).
-async function startOnline({ browser, base, netplay }, { query = '', init = null } = {}) {
+// delay: frames to start with instead of Auto (whose pick depends on how far away the room server is)
+async function startOnline({ browser, base, netplay }, { query = '', init = null, delay = null } = {}) {
   const [hq, gq] = Array.isArray(query) ? query : [query, query];
   const np = `netplay=${encodeURIComponent(netplay)}`;
   const host = await player(browser, `${base}?${np}${hq}`, 'host', init);
@@ -649,6 +650,7 @@ async function startOnline({ browser, base, netplay }, { query = '', init = null
   await guest.waitForSelector('#view-lobby:not(.hidden)');
   await host.waitForFunction(() => !document.getElementById('np-start').disabled);
   await sleep(1500);   // a few pings, for the auto delay
+  if (delay) await host.evaluate((d) => { document.getElementById('np-delay').value = d; }, String(delay));
   await host.click('#np-start');
   return [host, guest];
 }
@@ -672,6 +674,32 @@ test('online: two players stay in lockstep', async (env) => {
   await Promise.all([waitFrames(host, 300, 30000), waitFrames(guest, 300, 30000)]);
   await noDesync([host, guest]);
   assert.match(await host.textContent('#netstatus'), /Online · player 1 of 2/);
+}, { online: true });
+
+test('online: the mouse works, the same for both players (the screens the PC version leaves to it)', async (env) => {
+  const players = await startOnline(env);
+  const [host, guest] = players;
+  await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
+  const use = (p, dx, dy) => p.evaluate(([dx, dy]) => {
+    const canvas = document.getElementById('canvas');
+    canvas.dispatchEvent(new MouseEvent('mousemove', { movementX: dx, movementY: dy, bubbles: true }));
+    canvas.dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true }));
+    window.dispatchEvent(new MouseEvent('mouseup', { button: 0 }));
+  }, [dx, dy]);
+  const cursors = () => Promise.all(players.map((p) => p.evaluate(() => { const { x, y, clicks } = window.recomp._test_mouse(); return { x, y, clicks }; })));
+  const until = async (want) => {
+    for (const t0 = Date.now(); Date.now() - t0 < 10000; await sleep(100)) {
+      const c = await cursors();
+      if (c.every((m) => m.x === want.x && m.y === want.y && m.clicks === want.clicks)) return;
+    }
+    assert.fail(`cursors ${JSON.stringify(await cursors())}, wanted ${JSON.stringify(want)} on both`);
+  };
+  await use(guest, 30, 20);   // the guest moves and clicks: both games see it
+  await until({ x: 350, y: 260, clicks: 1 });
+  await use(host, -50, 5);    // then the host, the same cursor
+  await until({ x: 300, y: 265, clicks: 2 });
+  await waitFrames(host, 200, 30000);
+  await noDesync(players);
 }, { online: true });
 
 // A bad connection for the online tests (an init script): everything the page sends waits window.__net.base
@@ -712,11 +740,22 @@ function NET_SHAPER() {
 const setNet = (players, net) => Promise.all(players.map((p) => p.evaluate((n) => Object.assign(window.__net, n), net)));
 const BAD_NET = { base: 20, jitter: 100 };   // 20-120 ms each way
 const delays = (players) => Promise.all(players.map(async (p) => (await netInfo(p)).delay));
+// the delays once they have stayed put for 3 s (a start delay longer than the connection needs comes down first)
+async function settledDelays(players, ms = 30000) {
+  const t0 = Date.now();
+  let last = await delays(players), since = Date.now();
+  for (;;) {
+    await sleep(250);
+    const d = await delays(players);
+    if (String(d) !== String(last)) { last = d; since = Date.now(); } else if (Date.now() - since >= 3000) return d;
+    if (Date.now() - t0 > ms) throw new Error(`the delays did not settle (now ${d})`);
+  }
+}
 
 test('online: the input delay rises with jitter and comes back down when it calms', async (env) => {
-  const players = await startOnline(env, { init: NET_SHAPER });
+  const players = await startOnline(env, { init: NET_SHAPER, delay: 4 });
   await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
-  const calm = await delays(players);
+  const calm = await settledDelays(players);
   await setNet(players, BAD_NET);
   const t0 = Date.now();
   const up = await delaysUntil(players, `the delays to rise from ${calm}`, (d) => d.every((x, i) => x >= calm[i] + 2), 20000);
@@ -738,14 +777,14 @@ test('online: the delay adapts with the room as the only path', async (env) => {
   const players = await startOnline(env, { init: [noWebRTC, NET_SHAPER] });
   await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
   assert.match(await players[0].textContent('#netstatus'), /· through the room \d+ ms/);
-  const calm = await delays(players);
+  const calm = await settledDelays(players);
   await setNet(players, BAD_NET);
   await delaysUntil(players, `the delays to rise from ${calm}`, (d) => d.every((x, i) => x >= calm[i] + 2), 20000);
   await noDesync(players);
 }, { online: true });
 
 test('online: ?adaptive=0 keeps the delay the game started with', async (env) => {
-  const players = await startOnline(env, { query: '&adaptive=0', init: NET_SHAPER });
+  const players = await startOnline(env, { query: '&adaptive=0', init: NET_SHAPER, delay: 4 });
   await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
   const before = await delays(players);
   await setNet(players, BAD_NET);
