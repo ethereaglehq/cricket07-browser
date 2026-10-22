@@ -188,7 +188,13 @@
         started = true;
         // the saves every game starts from: the host's own copy, or what this player received and checked
         if (m.files) m.filesBytes = offered?.id === m.files.id ? offered.bytes : received.get(m.files.id) || null;
-        if (m.files && !m.filesBytes) opts.onError?.('The host\'s saves did not arrive; this match starts without them.');
+        if (m.files && !m.filesBytes) {
+          // starting without the saves every other game starts from would only part ways with them later
+          opts.onError?.('The host\'s saves did not arrive here, so this match can\'t start on this computer. Rejoin and try again.');
+          closing = true;
+          ws.close();
+          return;
+        }
         opts.onStart?.(m);
       }
       else if (m.t === 'files' && m.size <= MAX_FILES) {
