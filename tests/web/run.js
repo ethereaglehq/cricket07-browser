@@ -2,6 +2,8 @@
 // no game files. Headless Chromium through Playwright; online tests also start the room server locally.
 //
 //   node tests/web/run.js [name filter]
+//   BASE_URL=https://test.example.com node tests/web/run.js    the same tests against a deployed test site
+//                                                              (deploy/vm), its own room server included
 //
 // Needs Playwright (npm i -g playwright, or NODE_PATH pointing at it) and, for the online tests, wrangler
 // (npx wrangler, or WRANGLER=/path/to/wrangler). Each player is its own browser context: its own OPFS,
@@ -39,7 +41,7 @@ function makeGameFolder(extra = {}) {
 }
 
 async function player(browser, url, name = 'player') {
-  const ctx = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 860 } });
+  const ctx = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 860 }, ignoreHTTPSErrors: !!process.env.BASE_URL });
   await ctx.addInitScript(STUB_GPU);
   const page = await ctx.newPage();
   page.logs = [];
@@ -590,12 +592,13 @@ async function roomServer() {
 (async () => {
   const filter = process.argv[2] || '';
   const chosen = tests.filter((t) => t.name.includes(filter));
-  const server = await start(0);
-  const base = `http://localhost:${server.address().port}/`;
+  const server = process.env.BASE_URL ? null : await start(0);
+  const base = process.env.BASE_URL ? process.env.BASE_URL.replace(/\/?$/, '/') : `http://localhost:${server.address().port}/`;
   const browser = await chromium.launch();
   let rooms = null, failed = 0;
   try {
-    if (chosen.some((t) => t.online)) rooms = await roomServer();
+    if (process.env.BASE_URL) rooms = { url: new URL(base).origin, stop() {} };   // the site's own room server
+    else if (chosen.some((t) => t.online)) rooms = await roomServer();
     for (const t of chosen) {
       const t0 = Date.now();
       try {
@@ -610,7 +613,7 @@ async function roomServer() {
   } finally {
     rooms?.stop();
     await browser.close();
-    server.close();
+    server?.close();
   }
   console.log(failed ? `${failed} of ${chosen.length} failed` : `all ${chosen.length} passed`);
   process.exit(failed ? 1 : 0);
