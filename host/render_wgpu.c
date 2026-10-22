@@ -552,6 +552,7 @@ static WGPUBlendOperation bop(uint32_t o) {
 static WGPURenderPipeline pipeline_for(const PKey *k) {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < sizeof *k / 4; i++) h = (h ^ ((const uint32_t *)k)[i]) * 16777619u;
+again:
     for (uint32_t i = 0; i < 512; i++) {
         PEntry *e = &g_pipes[(h + i) % 512];
         if (e->p && !memcmp(&e->k, k, sizeof *k)) return e->p;
@@ -595,8 +596,12 @@ static WGPURenderPipeline pipeline_for(const PKey *k) {
             return e->p;
         }
     }
-    fprintf(stderr, "[wgpu] pipeline cache full\n");
-    return g_pipes[0].p;
+    /* Full: start it over (passes already recorded keep the pipelines they use). It used to draw with entry 0,
+       another render state's pipeline, and log a line per draw, hundreds a frame. */
+    static int told;
+    if (!told++) fprintf(stderr, "[wgpu] pipeline cache full (512 render states): starting it over\n");
+    for (uint32_t i = 0; i < 512; i++) if (g_pipes[i].p) { wgpuRenderPipelineRelease(g_pipes[i].p); g_pipes[i].p = NULL; }
+    goto again;
 }
 
 /* ------------------------------------------------------------------ frames and passes */
@@ -723,19 +728,24 @@ static GSurf *gsurf(uint32_t id, uint32_t w, uint32_t h, int depth) {
 /* depth buffer for targets whose depth surface doesn't match their size (WebGPU needs equal sizes) */
 static WGPUTextureView scratch_depth(uint32_t w, uint32_t h) {
     static struct { uint32_t w, h; WGPUTexture t; WGPUTextureView v; } cache[8];
+    static unsigned next;
     for (int i = 0; i < 8; i++) if (cache[i].t && cache[i].w == w && cache[i].h == h) return cache[i].v;
-    for (int i = 0; i < 8; i++)
-        if (!cache[i].t) {
-            WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
-            td.size = (WGPUExtent3D){ w, h, 1 };
-            td.format = WGPUTextureFormat_Depth24PlusStencil8;
-            td.usage = WGPUTextureUsage_RenderAttachment;
-            cache[i].t = wgpuDeviceCreateTexture(g_dev, &td);
-            cache[i].v = wgpuTextureCreateView(cache[i].t, NULL);
-            cache[i].w = w; cache[i].h = h;
-            return cache[i].v;
-        }
-    return cache[0].v;
+    int i = 0;
+    while (i < 8 && cache[i].t) i++;
+    if (i == 8) {   /* all taken: replace one (handing back another size made the render pass invalid) */
+        i = (int)(next++ % 8);
+        if (cache[i].v == g_tgt_depth) { end_pass(); g_tgt_depth = NULL; }
+        release_view(cache[i].v);
+        retire_texture(cache[i].t);   /* destroyed once the work recorded with it is submitted */
+    }
+    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    td.size = (WGPUExtent3D){ w, h, 1 };
+    td.format = WGPUTextureFormat_Depth24PlusStencil8;
+    td.usage = WGPUTextureUsage_RenderAttachment;
+    cache[i].t = wgpuDeviceCreateTexture(g_dev, &td);
+    cache[i].v = wgpuTextureCreateView(cache[i].t, NULL);
+    cache[i].w = w; cache[i].h = h;
+    return cache[i].v;
 }
 
 static void exec_target(const CmdTarget *c) {
@@ -1211,6 +1221,14 @@ static void on_web_device(WGPURequestDeviceStatus st, WGPUDevice d, WGPUStringVi
     __atomic_store_n(&g_ready, 1, __ATOMIC_RELEASE);
 }
 
+/* Nothing draws after this (the GPU process restarted, the driver reset, or the GPU ran out of memory): the page
+   shows it instead of a frozen or black picture (web/loader.js). */
+static void on_device_lost(WGPUDevice const *d, WGPUDeviceLostReason r, WGPUStringView msg, void *u1, void *u2) {
+    (void)d; (void)u1; (void)u2;
+    if (r == WGPUDeviceLostReason_Destroyed || r == WGPUDeviceLostReason_CallbackCancelled) return;   /* page closing */
+    fprintf(stderr, "[wgpu] device lost (reason %d): %.*s\n", (int)r, (int)msg.length, msg.data);
+}
+
 static void request_web_adapter(int attempt);
 static void on_web_adapter(WGPURequestAdapterStatus st, WGPUAdapter a, WGPUStringView msg, void *u1, void *u2) {
     (void)u2;
@@ -1224,6 +1242,8 @@ static void on_web_adapter(WGPURequestAdapterStatus st, WGPUAdapter a, WGPUStrin
     g_adapter = a;
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
+    dd.deviceLostCallbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+    dd.deviceLostCallbackInfo.callback = on_device_lost;
     static const WGPUFeatureName bc = WGPUFeatureName_TextureCompressionBC;
     g_gpu_bc = wgpuAdapterHasFeature(g_adapter, bc) && !getenv("RC_NO_BC");   /* DXT textures stay compressed */
     if (g_gpu_bc) { dd.requiredFeatureCount = 1; dd.requiredFeatures = &bc; }
