@@ -34,6 +34,8 @@ typedef struct ComObj {
 uint32_t com_new(ComInterface *it, int type, void *data);  /* returns the guest object pointer */
 ComObj *com_get(uint32_t guest);                           /* NULL if not one of ours */
 void *com_data(uint32_t guest);
+int com_release(uint32_t guest);                           /* Release from the host side; the new count */
+int com_live_objects(void);
 
 /* Standard IUnknown handlers usable in any interface's table. */
 void com_QueryInterface(CPU *c);

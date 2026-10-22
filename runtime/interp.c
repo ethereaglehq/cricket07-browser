@@ -12,23 +12,45 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define MAX_REGIONS 1024
+/* Regions are never removed (readers don't lock). A block that overlaps or touches a registered one widens it
+   instead of taking a slot (the union holds no address that wasn't registered), and a full table says so: the
+   code it drops traps later as an "indirect call to unknown function". */
+#define MAX_REGIONS 4096
 static struct { uint32_t lo, hi; } g_regions[MAX_REGIONS];
 static volatile int g_nregions;
+static volatile uint8_t g_regions_lock;   /* writers only */
 
 void dyncode_register(uint32_t addr, uint32_t len) {
-    for (int i = 0; i < g_nregions; i++)
-        if (g_regions[i].lo == addr) { g_regions[i].hi = addr + len; return; }
-    if (g_nregions >= MAX_REGIONS) return;
-    g_regions[g_nregions].lo = addr;
-    g_regions[g_nregions].hi = addr + len;
-    __atomic_add_fetch(&g_nregions, 1, __ATOMIC_RELEASE);
+    uint32_t hi = addr + len;
+    while (__atomic_test_and_set(&g_regions_lock, __ATOMIC_ACQUIRE)) { }
+    int i = 0;
+    for (; i < g_nregions; i++) {
+        if (g_regions[i].lo == addr) { g_regions[i].hi = hi; break; }   /* the same block again */
+        if (addr <= g_regions[i].hi && g_regions[i].lo <= hi) {
+            if (addr < g_regions[i].lo) g_regions[i].lo = addr;   /* a reader sees old, partly or fully widened */
+            if (hi > g_regions[i].hi) g_regions[i].hi = hi;
+            break;
+        }
+    }
+    if (i == g_nregions && g_nregions < MAX_REGIONS) {
+        g_regions[i].lo = addr;
+        g_regions[i].hi = hi;
+        __atomic_add_fetch(&g_nregions, 1, __ATOMIC_RELEASE);
+    } else if (i == g_nregions) {
+        static int n;
+        if (n++ % 100 == 0)
+            fprintf(stderr, "[interp] dynamic code table full (%d regions): code at %08x (%u bytes) can't run\n", MAX_REGIONS,
+                    addr, len);
+    }
+    __atomic_clear(&g_regions_lock, __ATOMIC_RELEASE);
 }
+
+int dyncode_regions(void) { return __atomic_load_n(&g_nregions, __ATOMIC_ACQUIRE); }
 
 int dyncode_contains(uint32_t addr) {
     if (addr >= g_image_lo && addr < g_image_hi) return 0;  /* never the image itself */
     int n = __atomic_load_n(&g_nregions, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n; i++)
+    for (int i = n - 1; i >= 0; i--)   /* newest first: the modules loaded last are the ones running */
         if (addr >= g_regions[i].lo && addr < g_regions[i].hi) return 1;
     return 0;
 }

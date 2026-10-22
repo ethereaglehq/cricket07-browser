@@ -51,6 +51,13 @@ W(LoadLibraryA) {
 }
 W(FreeLibrary) { RET(1, 1); }
 
+/* Like Windows, a function's address is the same every time it is looked up. D3DX looks up d3d8.dll's
+   ValidateVertexShader / ValidatePixelShader again for each shader it assembles, and each new address took a
+   permanent import slot (4096 in all). */
+static struct { char name[96]; uint32_t addr; } g_procs[256];
+static int g_nprocs;
+static pthread_mutex_t g_procs_lock = PTHREAD_MUTEX_INITIALIZER;
+
 W(GetProcAddress) {
     uint32_t mod = ARG(0), name = ARG(1);
     char full[160];
@@ -63,7 +70,16 @@ W(GetProcAddress) {
     if (name < 0x10000) { RET(2, 0); }  /* by ordinal: not supported */
     snprintf(full, sizeof full, "%s!%s", up, GSTR(name));
     GuestFn fn = find_import_handler(full);
-    uint32_t r = fn ? add_dynamic_import(full, fn) : 0;
+    uint32_t r = 0;
+    if (fn) {
+        pthread_mutex_lock(&g_procs_lock);
+        for (int i = 0; i < g_nprocs && !r; i++) if (!strcmp(g_procs[i].name, full)) r = g_procs[i].addr;
+        if (!r && (r = add_dynamic_import(full, fn)) && g_nprocs < 256) {
+            snprintf(g_procs[g_nprocs].name, sizeof g_procs[0].name, "%s", full);
+            g_procs[g_nprocs++].addr = r;
+        }
+        pthread_mutex_unlock(&g_procs_lock);
+    }
     LOG("[kernel32] GetProcAddress(%s) -> %08x\n", full, r);
     RET(2, r);
 }
@@ -367,8 +383,11 @@ W(GetTimeFormatA) {
 /* ------------------------------------------------------------------ memory */
 
 #define HEAP_HANDLE 0x00A70000u
-W(HeapCreate) { RET(3, HEAP_HANDLE); }
-W(HeapDestroy) { RET(1, 1); }
+/* Every heap is the one guest heap, so HeapDestroy frees nothing: a game that destroys a heap instead of
+   freeing its blocks leaks them. Counted for the [mem] log, to see whether that happens. */
+uint32_t g_heaps_created, g_heaps_destroyed;
+W(HeapCreate) { g_heaps_created++; LOG("[kernel32] HeapCreate(%x, %u, %u)\n", ARG(0), ARG(1), ARG(2)); RET(3, HEAP_HANDLE); }
+W(HeapDestroy) { g_heaps_destroyed++; LOG("[kernel32] HeapDestroy(%x): its blocks stay allocated\n", ARG(0)); RET(1, 1); }
 W(GetProcessHeap) { RET(0, HEAP_HANDLE); }
 W(HeapAlloc) { RET(3, heap_alloc(ARG(2), ARG(1) & 8)); }
 W(HeapFree) { heap_free(ARG(2)); RET(3, 1); }
@@ -381,12 +400,24 @@ W(GlobalAlloc) { RET(2, heap_alloc(ARG(1), ARG(0) & 0x40)); }
 W(GlobalFree) { heap_free(ARG(0)); RET(1, 0); }
 W(LocalFree) { heap_free(ARG(0)); RET(1, 0); }
 
+/* The VirtualAlloc window is full: fail the call as Windows does, and say so (the game may not check). */
+static void out_of_space(const char *what, uint32_t size) {
+    static int n;
+    if (n++ < 20) fprintf(stderr, "[kernel32] %s: out of guest address space (%u MB requested)\n", what, size >> 20);
+    set_error(8 /* ERROR_NOT_ENOUGH_MEMORY */);
+}
 W(VirtualAlloc) {
     uint32_t addr = ARG(0), size = ARG(1);
     if (addr) RET(4, addr);  /* committing inside a region we already handed out */
-    RET(4, guest_valloc(size));
+    uint32_t a = guest_valloc_as(size, VA_ALLOC);
+    if (!a) out_of_space("VirtualAlloc", size);
+    RET(4, a);
 }
-W(VirtualFree) { RET(3, 1); }
+/* MEM_RELEASE (of a whole region: size 0, its base) gives the range back; a decommit keeps it reserved. */
+W(VirtualFree) {
+    if ((ARG(2) & 0x8000) && !ARG(1)) guest_vfree(ARG(0), VA_ALLOC);
+    RET(3, 1);
+}
 W(VirtualProtect) {
     /* Executable protections mark code the game generated or loaded itself (e.g. sound-engine plug-ins). */
     if (ARG(2) & 0xf0) { LOG("[kernel32] VirtualProtect(%08x, %x, exec)\n", ARG(0), ARG(1)); dyncode_register(ARG(0), ARG(1)); }
@@ -437,23 +468,41 @@ static CS *cs_get(uint32_t key) {
     pthread_mutex_unlock(&g_cs_lock);
     return x;
 }
-static pthread_mutex_t *cs_for(uint32_t key) { return &cs_get(key)->m; }
-/* Deterministic mode: ownership is tracked here and a contended Enter blocks in the scheduler (a host
-   mutex would block while holding the scheduler's baton). */
+/* A critical section starts out unlocked, as on Windows, even at an address where an earlier one was deleted
+   while still held (DeleteCriticalSection does nothing here) and its memory reused for a new object: that one's
+   host mutex can't be reset, so it is replaced, and the old one is left to whoever still holds it. Before, the
+   next thread to enter the new one waited forever. */
+static void cs_init(uint32_t key) {
+    pthread_mutex_lock(&g_cs_lock);
+    for (CS **pp = &g_cs[(key >> 2) & 1023]; *pp; pp = &(*pp)->next)
+        if ((*pp)->key == key) {
+            if ((*pp)->depth) { LOG("[kernel32] critical section %08x initialized while held: a fresh one\n", key); *pp = (*pp)->next; }
+            break;
+        }
+    pthread_mutex_unlock(&g_cs_lock);
+    cs_get(key);
+}
+/* owner and depth are kept in both modes (natively under the host mutex), so cs_init can tell a held one.
+   Deterministic mode: a contended Enter blocks in the scheduler (a host mutex would block while holding the
+   scheduler's baton). */
 static int cs_free(void *p) { return ((CS *)p)->owner == NULL; }
-W(InitializeCriticalSection) { memset(HP(ARG(0)), 0, 24); W32(ARG(0) + 4, 0xFFFFFFFFu); cs_for(ARG(0)); RET(1, 0); }
+W(InitializeCriticalSection) { memset(HP(ARG(0)), 0, 24); W32(ARG(0) + 4, 0xFFFFFFFFu); cs_init(ARG(0)); RET(1, 0); }
 W(DeleteCriticalSection) { RET(1, 0); }
 W(EnterCriticalSection) {
-    if (!sched_active()) { pthread_mutex_lock(cs_for(ARG(0))); RET(1, 0); }
     CS *x = cs_get(ARG(0));
+    if (!sched_active()) { pthread_mutex_lock(&x->m); x->owner = t_self; x->depth++; RET(1, 0); }
     if (x->owner != t_self) sched_wait(cs_free, x, UINT64_MAX, NULL);
     x->owner = t_self;
     x->depth++;
     RET(1, 0);
 }
 W(LeaveCriticalSection) {
-    if (!sched_active()) { pthread_mutex_unlock(cs_for(ARG(0))); RET(1, 0); }
     CS *x = cs_get(ARG(0));
+    if (!sched_active()) {
+        if (x->owner == t_self && x->depth > 0 && --x->depth == 0) x->owner = NULL;
+        pthread_mutex_unlock(&x->m);
+        RET(1, 0);
+    }
     if (x->owner == t_self && --x->depth == 0) x->owner = NULL;
     RET(1, 0);
 }
@@ -669,10 +718,34 @@ static uint32_t g_next_tid = 0x200;
 typedef struct { GuestThread *t; uint32_t start, param; Sync *sync; int suspended; pthread_mutex_t go_m;
                  pthread_cond_t go_cv; void *sched; } ThreadStart;
 static int thread_resumed(void *p) { return !((ThreadStart *)p)->suspended; }
+static __thread ThreadStart *t_start;   /* the running guest thread's start record (none on the game's main thread) */
+GuestThread *g_all_threads[64];   /* for the watchdog */
+int g_nthreads, g_threads_done;
+
+/* A finished thread's guest stack and TIB can be handed out again, as Windows frees them when a thread ends. */
+static void guest_thread_free(GuestThread *t) {
+    if (t->stack) guest_vfree(t->stack, VA_STACK);
+    if (t->tib) guest_vfree(t->tib, VA_STACK);
+    t->stack = t->tib = 0;
+}
+
+/* The thread is done, by returning or by ExitThread: its handle becomes signaled with the exit code, which wakes
+   WaitForSingleObject on it. (ExitThread used to skip this, and a wait for that thread never returned.) */
+static void thread_finish(ThreadStart *ts, uint32_t code) {
+    LOG("[kernel32] thread %x exits with %u\n", ts->t->id, code);
+    guest_thread_free(ts->t);   /* no guest code runs on this thread from here on */
+    __atomic_add_fetch(&g_threads_done, 1, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&ts->sync->m);
+    ts->sync->finished = 1;
+    ts->sync->exit_code = code;
+    pthread_cond_broadcast(&ts->sync->cv);
+    pthread_mutex_unlock(&ts->sync->m);
+}
 
 static void *thread_main(void *arg) {
     ThreadStart *ts = arg;
     t_self = ts->t;
+    t_start = ts;
     CPU *c = &ts->t->cpu;
     fpu_sync_rounding(c);
     sched_enter(ts->sched);   /* deterministic mode: runs once resumed and scheduled */
@@ -683,29 +756,29 @@ static void *thread_main(void *arg) {
     PUSH32(c, ts->param);
     PUSH32(c, GUEST_RETURN_SENTINEL);
     call_indirect(c, ts->start);
-    pthread_mutex_lock(&ts->sync->m);
-    ts->sync->finished = 1;
-    ts->sync->exit_code = c->eax;
-    pthread_cond_broadcast(&ts->sync->cv);
-    pthread_mutex_unlock(&ts->sync->m);
-    LOG("[kernel32] thread %x exits with %u\n", ts->t->id, c->eax);
+    thread_finish(ts, c->eax);
     sched_exit();
     return NULL;
 }
 
 static ThreadStart *g_threads_by_handle[4096];
 
-/* A guest thread context: its own CPU state, guest stack and thread information block. */
-GuestThread *g_all_threads[64];   /* for the watchdog */
-int g_nthreads;
-
+/* A guest thread context: its own CPU state, guest stack and thread information block. NULL when the
+   VirtualAlloc window has no room left for them. */
 GuestThread *guest_thread_new(void) {
+    uint32_t stack = guest_valloc_as(THREAD_STACK_SIZE, VA_STACK), tib = guest_valloc_as(0x1000, VA_STACK);
+    if (!stack || !tib) {   /* the TIB used to go to guest address 0, and the stack below the game's own */
+        if (stack) guest_vfree(stack, VA_STACK);
+        if (tib) guest_vfree(tib, VA_STACK);
+        out_of_space("CreateThread", THREAD_STACK_SIZE);
+        return NULL;
+    }
     GuestThread *t = calloc(1, sizeof *t);
     int slot = __atomic_fetch_add(&g_nthreads, 1, __ATOMIC_SEQ_CST);
     if (slot < 64) g_all_threads[slot] = t;
     t->id = __atomic_fetch_add(&g_next_tid, 4, __ATOMIC_SEQ_CST);
-    uint32_t stack = guest_valloc(THREAD_STACK_SIZE);
-    t->tib = guest_valloc(0x1000);
+    t->stack = stack;
+    t->tib = tib;
     W32(t->tib + 0x00, 0xFFFFFFFFu);
     W32(t->tib + 0x04, stack + THREAD_STACK_SIZE);
     W32(t->tib + 0x08, stack);
@@ -722,6 +795,7 @@ GuestThread *guest_thread_new(void) {
 W(CreateThread) {
     uint32_t start = ARG(2), param = ARG(3), flags = ARG(4), tid_out = ARG(5);
     GuestThread *t = guest_thread_new();
+    if (!t) RET(6, 0);
 
     uint32_t h = handle_new(H_THREAD);
     ThreadStart *ts = calloc(1, sizeof *ts);
@@ -739,7 +813,17 @@ W(CreateThread) {
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setstacksize(&at, 64u << 20);  /* host stack: recompiled frames are large (more so in wasm) */
-    pthread_create(&pt, &at, thread_main, ts);
+    int e = pthread_create(&pt, &at, thread_main, ts);
+    pthread_attr_destroy(&at);
+    if (e) {   /* fail the call, as Windows would, rather than hand out a thread that never runs or ends */
+        fprintf(stderr, "[kernel32] CreateThread(start=%08x) failed: no host thread (error %d)\n", start, e);
+        sched_drop(ts->sched);
+        thread_finish(ts, 0);
+        handle_close(h);
+        g_threads_by_handle[(h - 0x1000) / 4] = NULL;
+        set_error(8 /* ERROR_NOT_ENOUGH_MEMORY */);
+        RET(6, 0);
+    }
     pthread_detach(pt);
     LOG("[kernel32] CreateThread(start=%08x param=%08x flags=%x) -> handle %x tid %x\n", start, param, flags, h, t->id);
     RET(6, h);
@@ -759,10 +843,17 @@ W(ResumeThread) {
 }
 W(ExitThread) {
     LOG("[kernel32] ExitThread(%u)\n", ARG(0));
+    if (t_start) thread_finish(t_start, ARG(0));
     sched_exit();
     pthread_exit(NULL);
 }
-W(TerminateThread) { STUB("TerminateThread(%x) ignored\n", ARG(0)); RET(2, 1); }
+/* A host thread can't be stopped from outside, so the thread keeps running (and its handle unsignaled). Said
+   always, not only with RC_LOG: a wait on that thread is a likely hang. */
+W(TerminateThread) {
+    static int n;
+    if (n++ < 10) fprintf(stderr, "[kernel32] TerminateThread(%x) is not supported: the thread keeps running\n", ARG(0));
+    RET(2, 1);
+}
 W(GetExitCodeThread) {
     WinHandle *x = handle_get(ARG(0), H_THREAD);
     Sync *s = x ? x->ptr : NULL;
@@ -1043,8 +1134,12 @@ W(MapViewOfFile) {
     if (!m || m->fd < 0) RET(5, 0);
     struct stat st;
     fstat(m->fd, &st);
-    uint32_t off = ARG(3), len = ARG(4) ? ARG(4) : (uint32_t)st.st_size - off;
-    uint32_t a = guest_valloc(len);
+    uint32_t off = ARG(3);
+    if ((uint64_t)off > (uint64_t)st.st_size) { set_error(ERROR_ACCESS_DENIED); RET(5, 0); }
+    uint32_t len = ARG(4) ? ARG(4) : (uint32_t)st.st_size - off;
+    /* no room: fail (this used to read the file into guest address 0, over the main stack and the game's data) */
+    uint32_t a = guest_valloc_as(len, VA_VIEW);
+    if (!a) { out_of_space("MapViewOfFile", len); RET(5, 0); }
     /* copy-in (views are only read by the game); loop: a single read may come back short */
     uint32_t got = 0;
     while (got < len) {
@@ -1055,7 +1150,7 @@ W(MapViewOfFile) {
     LOG("[file] MapViewOfFile(%u bytes, read %u) -> %08x\n", len, got, a);
     RET(5, a);
 }
-W(UnmapViewOfFile) { RET(1, 1); }
+W(UnmapViewOfFile) { guest_vfree(ARG(0), VA_VIEW); RET(1, 1); }
 
 /* ------------------------------------------------------------------ resources (none exposed yet) */
 

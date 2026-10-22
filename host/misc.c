@@ -126,6 +126,7 @@ static void *timer_main(void *arg) {
     (void)arg;
     sched_enter(g_timer_sched);
     GuestThread *t = guest_thread_new();
+    if (!t) { fprintf(stderr, "[winmm] out of guest address space for the timer thread: timers won't fire\n"); sched_exit(); return NULL; }
     t_self = t;
     CPU *c = &t->cpu;
     fpu_sync_rounding(c);

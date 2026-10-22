@@ -116,6 +116,14 @@ void sched_enter(void *rec) {
     pthread_mutex_unlock(&g_lock);
 }
 
+/* A record whose host thread could not be started: never picked to run. */
+void sched_drop(void *rec) {
+    if (!rec) return;
+    pthread_mutex_lock(&g_lock);
+    ((SchedThread *)rec)->state = DEAD;
+    pthread_mutex_unlock(&g_lock);
+}
+
 void sched_exit(void) {
     if (!t_sched) return;
     pthread_mutex_lock(&g_lock);

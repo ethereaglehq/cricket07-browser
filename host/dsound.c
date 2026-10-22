@@ -28,11 +28,31 @@ typedef struct SBuf {
     double pos;                   /* play cursor in frames (fractional for resampling) */
     uint32_t notify_n, notify_off[64], notify_ev[64];
     struct SBuf *next;
+    int refs;                     /* COM objects on it: the buffer, and Notify / 3D interfaces from QueryInterface */
+    int *mem_users;               /* buffers sharing mem (DuplicateSoundBuffer); NULL without sound data */
 } SBuf;
 
 static SBuf *g_bufs;
+static int g_nbufs;
 static pthread_mutex_t g_snd_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_mixer_started;
+int dsound_live_buffers(void) { return g_nbufs; }   /* for the [mem] log */
+
+/* The last COM object on a buffer is gone: it stops, leaves the mixer and frees its memory (the sound data once
+   no duplicate shares it), as Windows does. Released buffers used to keep their memory and their place in the
+   mixer, and one released while playing a loop played on. */
+static void sbuf_unref(void *p) {
+    SBuf *b = p;
+    pthread_mutex_lock(&g_snd_lock);
+    if (--b->refs > 0) { pthread_mutex_unlock(&g_snd_lock); return; }
+    for (SBuf **pp = &g_bufs; *pp; pp = &(*pp)->next)
+        if (*pp == b) { *pp = b->next; break; }
+    g_nbufs--;
+    int last = b->mem_users && --*b->mem_users == 0;
+    pthread_mutex_unlock(&g_snd_lock);
+    if (last) { heap_free(b->mem); free(b->mem_users); }
+    free(b);
+}
 
 static ComInterface IDirectSound_i, IDirectSoundBuffer_i, IDirectSoundNotify_i, IDirectSound3DBuffer_i,
     IDirectSound3DListener_i;
@@ -199,9 +219,16 @@ W(b_QueryInterface) {
     static const uint8_t IID_3DListener[16] = { 0x84, 0xFA, 0x9A, 0x27, 0x81, 0x49, 0xCE, 0x11, 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 };
     const uint8_t *iid = HP(ARG(1));
     uint32_t out = THIS;
-    if (!memcmp(iid, IID_Notify, 16)) out = com_new(&IDirectSoundNotify_i, 0, buf(c));
-    else if (!memcmp(iid, IID_3DBuffer, 16)) out = com_new(&IDirectSound3DBuffer_i, 0, buf(c));
-    else if (!memcmp(iid, IID_3DListener, 16)) out = com_new(&IDirectSound3DListener_i, 0, buf(c));
+    SBuf *b = buf(c);
+    ComInterface *it = !memcmp(iid, IID_Notify, 16) ? &IDirectSoundNotify_i : !memcmp(iid, IID_3DBuffer, 16) ?
+        &IDirectSound3DBuffer_i : !memcmp(iid, IID_3DListener, 16) ? &IDirectSound3DListener_i : NULL;
+    if (it) {   /* another object on the same buffer, which keeps it alive */
+        if (b) { pthread_mutex_lock(&g_snd_lock); b->refs++; pthread_mutex_unlock(&g_snd_lock); }
+        out = com_new(it, 0, b);
+    } else {    /* the buffer itself (IDirectSoundBuffer8, ...): like any QueryInterface, a new reference */
+        ComObj *o = com_get(THIS);
+        if (o) o->refs++;
+    }
     W32(ARG(2), out);
     RET(3, S_OK);
 }
@@ -293,7 +320,7 @@ static const ComMethod buf_methods[] = {
     { "SetVolume", 1, b_SetVolume }, { "SetPan", 1, b_SetPan }, { "SetFrequency", 1, b_SetFrequency },
     { "Stop", 0, b_Stop }, { "Unlock", 4, b_Unlock }, { "Restore", 0, b_Restore },
 };
-static ComInterface IDirectSoundBuffer_i = { "IDirectSoundBuffer", buf_methods, 21, 0 };
+static ComInterface IDirectSoundBuffer_i = { "IDirectSoundBuffer", buf_methods, 21, 0, sbuf_unref };
 
 /* IDirectSoundNotify */
 W(n_SetNotificationPositions) {
@@ -310,7 +337,7 @@ static const ComMethod notify_methods[] = {
     { "QueryInterface", 2, com_QueryInterface }, { "AddRef", 0, com_AddRef }, { "Release", 0, com_Release },
     { "SetNotificationPositions", 2, n_SetNotificationPositions },
 };
-static ComInterface IDirectSoundNotify_i = { "IDirectSoundNotify", notify_methods, 4, 0 };
+static ComInterface IDirectSoundNotify_i = { "IDirectSoundNotify", notify_methods, 4, 0, sbuf_unref };
 
 /* 3D interfaces: accepted, ignored for now (sound stays 2D) */
 static const ComMethod b3d_methods[] = {
@@ -322,7 +349,7 @@ static const ComMethod b3d_methods[] = {
     { "SetConeOutsideVolume", 2, NULL }, { "SetMaxDistance", 2, NULL }, { "SetMinDistance", 2, NULL },
     { "SetMode", 2, NULL }, { "SetPosition", 4, NULL }, { "SetVelocity", 4, NULL },
 };
-static ComInterface IDirectSound3DBuffer_i = { "IDirectSound3DBuffer", b3d_methods, 21, 0 };
+static ComInterface IDirectSound3DBuffer_i = { "IDirectSound3DBuffer", b3d_methods, 21, 0, sbuf_unref };
 static const ComMethod l3d_methods[] = {
     { "QueryInterface", 2, com_QueryInterface }, { "AddRef", 0, com_AddRef }, { "Release", 0, com_Release },
     { "GetAllParameters", 1, NULL }, { "GetDistanceFactor", 1, NULL }, { "GetDopplerFactor", 1, NULL },
@@ -331,7 +358,7 @@ static const ComMethod l3d_methods[] = {
     { "SetDopplerFactor", 2, NULL }, { "SetOrientation", 7, NULL }, { "SetPosition", 4, NULL },
     { "SetRolloffFactor", 2, NULL }, { "SetVelocity", 4, NULL }, { "CommitDeferredSettings", 0, NULL },
 };
-static ComInterface IDirectSound3DListener_i = { "IDirectSound3DListener", l3d_methods, 18, 0 };
+static ComInterface IDirectSound3DListener_i = { "IDirectSound3DListener", l3d_methods, 18, 0, sbuf_unref };
 
 /* ------------------------------------------------------------------ IDirectSound */
 
@@ -344,10 +371,12 @@ static uint32_t new_buffer(uint32_t desc) {
     b->channels = 2; b->bits = 16; b->rate = MIX_RATE;
     if (wfx) { b->channels = R16(wfx + 2); b->rate = R32(wfx + 4); b->bits = R16(wfx + 14); }
     b->freq = b->rate;
-    if (!b->primary && b->size) b->mem = heap_alloc(b->size + 16, 1);
+    b->refs = 1;
+    if (!b->primary && b->size) { b->mem = heap_alloc(b->size + 16, 1); b->mem_users = malloc(sizeof *b->mem_users); *b->mem_users = 1; }
     pthread_mutex_lock(&g_snd_lock);
     b->next = g_bufs;
     g_bufs = b;
+    g_nbufs++;
     pthread_mutex_unlock(&g_snd_lock);
     LOG("[dsound] CreateSoundBuffer: %s %u bytes, %u Hz %u ch %u bit, flags %x\n", b->primary ? "primary" : "secondary",
         b->size, b->rate, b->channels, b->bits, b->flags);
@@ -367,10 +396,12 @@ W(ds_DuplicateSoundBuffer) {
     SBuf *src = com_data(ARG(1));
     if (!src) RET(3, DSERR_INVALIDPARAM);
     SBuf *b = calloc(1, sizeof *b);
-    *b = *src;
-    b->playing = 0; b->pos = 0; b->notify_n = 0;
     pthread_mutex_lock(&g_snd_lock);
+    *b = *src;
+    b->playing = 0; b->pos = 0; b->notify_n = 0; b->refs = 1;
+    if (b->mem_users) ++*b->mem_users;   /* the duplicate plays the same sound data */
     b->next = g_bufs; g_bufs = b;
+    g_nbufs++;
     pthread_mutex_unlock(&g_snd_lock);
     W32(ARG(2), com_new(&IDirectSoundBuffer_i, 0, b));
     RET(3, S_OK);

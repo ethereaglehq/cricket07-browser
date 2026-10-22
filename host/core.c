@@ -24,6 +24,7 @@ char g_user_root[1024];
 static pthread_mutex_t g_heap_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_heap_top = HEAP_LO;
 static uint32_t g_free[NCLASS + 1];  /* singly linked through the first payload word */
+static uint32_t g_heap_free_bytes;   /* payload of the blocks on those lists (for the [mem] log) */
 
 static uint32_t round16(uint32_t n) { return (n + 15) & ~15u; }
 
@@ -34,19 +35,37 @@ uint32_t heap_alloc(uint32_t size, int zero) {
     if (cls <= NCLASS && g_free[cls]) {
         a = g_free[cls];
         g_free[cls] = R32(a);
-    } else if (cls > NCLASS) {  /* first fit among large free blocks */
-        uint32_t prev = 0, p = g_free[0];
-        while (p && R32(p - 16) < sz) { prev = p; p = R32(p); }
-        if (p) {
-            a = p;
-            if (prev) W32(prev, R32(p)); else g_free[0] = R32(p);
-            sz = R32(p - 16);
+        g_heap_free_bytes -= sz;
+    } else if (cls > NCLASS) {
+        /* Best fit among large free blocks, and what a much bigger block has left over becomes a free block of
+           its own: first fit without splitting let a 5 KB request take a freed 10 MB texture whole, so the heap
+           kept growing from match to match until it ran out. */
+        uint32_t prev = 0, p = g_free[0], bprev = 0, best = 0;
+        for (; p; prev = p, p = R32(p)) {
+            uint32_t s = R32(p - 16);
+            if (s >= sz && (!best || s < R32(best - 16))) { best = p; bprev = prev; if (s == sz) break; }
+        }
+        if (best) {
+            a = best;
+            if (bprev) W32(bprev, R32(best)); else g_free[0] = R32(best);
+            uint32_t have = R32(a - 16);
+            g_heap_free_bytes -= have;
+            if (have - sz > 16 + 16 * NCLASS) {   /* the rest is still a large block: it goes back on this list */
+                uint32_t r = a + sz + 16;
+                W32(r - 16, have - sz - 16); W32(r - 12, 0);
+                W32(r, g_free[0]); g_free[0] = r;
+                g_heap_free_bytes += have - sz - 16;
+                W32(a - 16, sz);
+            }
+            sz = R32(a - 16);
         }
     }
     if (!a) {
         if (g_heap_top + 16 + sz > HEAP_HI) {
+            uint32_t used = g_heap_top - HEAP_LO, free_bytes = g_heap_free_bytes;
             pthread_mutex_unlock(&g_heap_lock);
-            fprintf(stderr, "guest heap exhausted (%u bytes requested)\n", size);
+            fprintf(stderr, "guest heap exhausted (%u bytes requested; %u MB used, %u MB of it in free blocks)\n", size,
+                    used >> 20, free_bytes >> 20);
             abort();
         }
         a = g_heap_top + 16;
@@ -68,6 +87,7 @@ void heap_free(uint32_t a) {
     pthread_mutex_lock(&g_heap_lock);
     W32(a - 12, 0);
     uint32_t cls = R32(a - 16) / 16;
+    g_heap_free_bytes += R32(a - 16);
     if (cls > NCLASS) cls = 0;
     W32(a, g_free[cls]);
     g_free[cls] = a;
@@ -89,24 +109,89 @@ uint32_t heap_realloc(uint32_t a, uint32_t size, int zero) {
     return b;
 }
 
+/* The VirtualAlloc window: VirtualAlloc'd memory, mapped file views and guest thread stacks, 64 KiB-granular.
+   Each region is remembered by its base and kind, so VirtualFree(MEM_RELEASE), UnmapViewOfFile and a thread's exit
+   give it back; without that the window filled up a few matches in. Freed ranges are kept sorted by address and
+   merged with their neighbours, reused first fit, and a range ending at the top lowers the top again. */
 #define VALLOC_LO GUEST_VALLOC_LO
 #define VALLOC_HI GUEST_VALLOC_HI
+#define VREGIONS 4096
+typedef struct { uint32_t base, size; int kind; } VRange;
+static VRange g_vlive[VREGIONS], g_vfree[VREGIONS];   /* live: any order; free: sorted, never touching */
+static int g_nvlive, g_nvfree;
 static uint32_t g_valloc_top = VALLOC_LO;
+static uint32_t g_valloc_hwm = VALLOC_LO;   /* everything above it is still zero, as calloc/mmap left it */
+static uint32_t g_valloc_live;   /* bytes in live regions */
 
-uint32_t guest_valloc(uint32_t size) {
-    size = (size + 0xffff) & ~0xffffu;  /* Windows allocation granularity */
+uint32_t guest_valloc_as(uint32_t size, int kind) {
+    if (size > VALLOC_HI - VALLOC_LO) return 0;
+    size = size ? (size + 0xffff) & ~0xffffu : 0x10000u;  /* Windows allocation granularity */
     pthread_mutex_lock(&g_heap_lock);
-    uint32_t a = g_valloc_top;
-    if (a + size > VALLOC_HI) { pthread_mutex_unlock(&g_heap_lock); return 0; }
-    g_valloc_top += size;
+    uint32_t a = 0;
+    for (int i = 0; i < g_nvfree; i++)
+        if (g_vfree[i].size >= size) {
+            a = g_vfree[i].base;
+            g_vfree[i].base += size; g_vfree[i].size -= size;
+            if (!g_vfree[i].size) memmove(&g_vfree[i], &g_vfree[i + 1], (size_t)(--g_nvfree - i) * sizeof *g_vfree);
+            break;
+        }
+    if (!a) {
+        if (size > VALLOC_HI - g_valloc_top) { pthread_mutex_unlock(&g_heap_lock); return 0; }
+        a = g_valloc_top;
+        g_valloc_top += size;
+    }
+    static int warned;
+    if (g_nvlive < VREGIONS) g_vlive[g_nvlive++] = (VRange){ a, size, kind };
+    else if (!warned++) fprintf(stderr, "[valloc] region table full (%d): later regions are never given back\n", VREGIONS);
+    g_valloc_live += size;
+    uint32_t dirty = a + size < g_valloc_hwm ? a + size : g_valloc_hwm;   /* part of it was used before */
+    if (a + size > g_valloc_hwm) g_valloc_hwm = a + size;
     pthread_mutex_unlock(&g_heap_lock);
-    return a;  /* never handed out before, so still zero */
+    if (dirty > a) memset(HP(a), 0, dirty - a);   /* VirtualAlloc'd memory starts out zero */
+    return a;
+}
+uint32_t guest_valloc(uint32_t size) { return guest_valloc_as(size, VA_ALLOC); }
+
+int guest_vfree(uint32_t base, int kind) {
+    pthread_mutex_lock(&g_heap_lock);
+    int i = 0;
+    while (i < g_nvlive && !(g_vlive[i].base == base && g_vlive[i].kind == kind)) i++;
+    if (i == g_nvlive) { pthread_mutex_unlock(&g_heap_lock); return 0; }
+    uint32_t size = g_vlive[i].size;
+    g_vlive[i] = g_vlive[--g_nvlive];
+    g_valloc_live -= size;
+    int k = 0;
+    while (k < g_nvfree && g_vfree[k].base < base) k++;
+    int prev = k > 0 && g_vfree[k - 1].base + g_vfree[k - 1].size == base;
+    int next = k < g_nvfree && base + size == g_vfree[k].base;
+    if (prev && next) {
+        g_vfree[k - 1].size += size + g_vfree[k].size;
+        memmove(&g_vfree[k], &g_vfree[k + 1], (size_t)(--g_nvfree - k) * sizeof *g_vfree);
+    } else if (prev) g_vfree[k - 1].size += size;
+    else if (next) { g_vfree[k].base = base; g_vfree[k].size += size; }
+    else if (g_nvfree < VREGIONS) {
+        memmove(&g_vfree[k + 1], &g_vfree[k], (size_t)(g_nvfree++ - k) * sizeof *g_vfree);
+        g_vfree[k] = (VRange){ base, size, 0 };
+    } else { pthread_mutex_unlock(&g_heap_lock); return 1; }   /* nowhere to note it: stays unusable, as before */
+    VRange *last = &g_vfree[g_nvfree - 1];
+    if (last->base + last->size == g_valloc_top) {   /* lower the top (still below the high-water mark: zeroed on reuse) */
+        g_valloc_top = last->base;
+        g_nvfree--;
+    }
+    pthread_mutex_unlock(&g_heap_lock);
+    return 1;
 }
 
 void guest_mem_ranges(uint32_t r[4]) { r[0] = HEAP_LO; r[1] = g_heap_top; r[2] = VALLOC_LO; r[3] = g_valloc_top; }
 void guest_mem_stats(uint32_t *heap_used, uint32_t *valloc_used) {
     *heap_used = g_heap_top - HEAP_LO;
     *valloc_used = g_valloc_top - VALLOC_LO;
+}
+/* For the [mem] log: the heap's bytes in free blocks, the VirtualAlloc window's bytes in live regions. */
+void guest_mem_free(uint32_t *heap_free, uint32_t *valloc_live) {
+    pthread_mutex_lock(&g_heap_lock);
+    *heap_free = g_heap_free_bytes; *valloc_live = g_valloc_live;
+    pthread_mutex_unlock(&g_heap_lock);
 }
 
 uint32_t guest_strdup(const char *s) {
@@ -148,7 +233,8 @@ WinHandle *handle_get(uint32_t h, int type) {
 void handle_close(uint32_t h) {
     WinHandle *x = handle_get(h, -1);
     if (!x) return;
-    if (x->type == H_FILE && x->fd >= 0) close(x->fd);
+    /* a file mapping holds its own dup() of the file's descriptor */
+    if ((x->type == H_FILE || x->type == H_MAPPING) && x->fd >= 0) close(x->fd);
     if (x->type == H_FIND && x->ptr) free(x->ptr);
     x->type = H_FREE;
 }

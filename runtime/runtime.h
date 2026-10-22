@@ -50,6 +50,8 @@ void register_all_functions(void);  /* generated */
 /* Code created at run time (e.g. sound-engine plug-ins loaded from data files): interpreted, see interp.c */
 void dyncode_register(uint32_t addr, uint32_t len);
 int dyncode_contains(uint32_t addr);
+int dyncode_regions(void);                  /* how many are registered (for the [mem] log) */
+uint32_t import_slots_used(void);           /* of the 4096 import slots */
 void interp_call(CPU *c, uint32_t eip);   /* return address already pushed */
 
 typedef struct { uint32_t addr; uint32_t regs[8]; double st0; uint32_t top; } TraceRec;

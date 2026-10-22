@@ -370,16 +370,24 @@ W(dev_Present) {
     static int fps_log = -1;
     if (fps_log < 0) fps_log = getenv("RC_LOG_FPS") != NULL;
     double now = host_seconds();
-    if (fps_log && now - last_t >= 2.0) {
-        if (last_t) fprintf(stderr, "[fps] %.1f  (frame %u, %u draws in the last frame)\n",
-                            (d->frame - last_f) / (now - last_t), d->frame, d->draws_this_frame);
+    /* every 2 s with RC_LOG_FPS (?fps), every 10 s with RC_LOG (?log): whatever grows from match to match shows */
+    if ((fps_log && now - last_t >= 2.0) || (g_log && now - last_t >= 10.0)) {
+        if (last_t && fps_log) fprintf(stderr, "[fps] %.1f  (frame %u, %u draws in the last frame)\n",
+                                       (d->frame - last_f) / (now - last_t), d->frame, d->draws_this_frame);
         extern void guest_mem_stats(uint32_t *, uint32_t *);
-        uint32_t hu, vu;
+        extern void guest_mem_free(uint32_t *, uint32_t *);
+        uint32_t hu, vu, hf, vl;
         guest_mem_stats(&hu, &vu);
+        guest_mem_free(&hf, &vl);
         extern size_t g_gpu_tex_bytes;
-        extern uint32_t g_gpu_bind_groups_made;
-        fprintf(stderr, "[mem] guest heap %u MB, virtual allocations %u MB, GPU textures %zu MB, bind groups made %u\n",
-                hu >> 20, vu >> 20, g_gpu_tex_bytes >> 20, g_gpu_bind_groups_made);
+        extern uint32_t g_gpu_bind_groups_made, g_heaps_created, g_heaps_destroyed;
+        extern int g_nthreads, g_threads_done, dsound_live_buffers(void);
+        fprintf(stderr, "[mem] guest heap %u MB (%u MB in free blocks), virtual allocations %u MB (%u MB live), GPU textures "
+                "%zu MB, bind groups made %u; frame %u, COM objects %d, sound buffers %d, threads %d of %d running, code "
+                "regions %d, import slots %u, heaps created %u destroyed %u\n",
+                hu >> 20, hf >> 20, vu >> 20, vl >> 20, g_gpu_tex_bytes >> 20, g_gpu_bind_groups_made, d->frame,
+                com_live_objects(), dsound_live_buffers(), g_nthreads - g_threads_done, g_nthreads, dyncode_regions(),
+                import_slots_used(), g_heaps_created, g_heaps_destroyed);
         last_t = now; last_f = d->frame;
     }
     if (g_render->present) g_render->present(d);
@@ -807,8 +815,15 @@ static void destroy_texture(void *p) {
         for (uint32_t l = 0; l < t->levels; l++) {
             heap_free(t->mem[f][l]);
             /* level surfaces handed out earlier point into this memory: detach them */
-            Surface *s = t->surfaces[f][l] ? com_data(t->surfaces[f][l]) : NULL;
-            if (s) { s->mem = 0; s->container = 0; }
+            uint32_t so = t->surfaces[f][l];
+            Surface *s = so ? com_data(so) : NULL;
+            if (!s) continue;
+            s->mem = 0; s->container = 0;
+            /* and drop the texture's own reference (texture_surface), so a surface the game no longer holds goes
+               away with its COM slot and, for a render-target texture, its GPU texture: they used to stay forever,
+               one more each time such a texture was made. Not while it is still the device's render target or
+               depth buffer, which the device doesn't hold a reference to here. */
+            if (!g_device || (g_device->st.render_target != so && g_device->st.depth_stencil != so)) com_release(so);
         }
     free(t);
 }

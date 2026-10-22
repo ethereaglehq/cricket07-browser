@@ -2,6 +2,7 @@
 #include "runtime.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdlib.h>
@@ -246,8 +247,11 @@ void rdtsc(CPU *c) {
 /* ------------------------------------------------------------------ imports */
 
 typedef struct { char name[96]; GuestFn fn; } ImportSlot;
-static ImportSlot g_imports[4096];  /* PE imports + GetProcAddress results + COM method slots */
+#define MAX_IMPORTS 4096
+static ImportSlot g_imports[MAX_IMPORTS];  /* PE imports + GetProcAddress results + COM method slots */
 static uint32_t g_nimports;
+static pthread_mutex_t g_imports_lock = PTHREAD_MUTEX_INITIALIZER;   /* GetProcAddress and COM run on any thread */
+uint32_t import_slots_used(void) { return g_nimports; }
 
 static void unimplemented_import(CPU *c) {
     /* The return address on the stack identifies the caller; the slot is found from the IAT
@@ -266,13 +270,22 @@ static GuestFn find_handler(const char *name) {
     return NULL;
 }
 
+/* Returns 0 when every slot is taken: writing past the table corrupted the runtime's own state. */
 uint32_t add_dynamic_import(const char *name, GuestFn fn) {
+    pthread_mutex_lock(&g_imports_lock);
+    if (g_nimports >= MAX_IMPORTS) {
+        pthread_mutex_unlock(&g_imports_lock);
+        static int n;
+        if (n++ < 10) fprintf(stderr, "import table full (%d slots): no address for %s\n", MAX_IMPORTS, name);
+        return 0;
+    }
     ImportSlot *sl = &g_imports[g_nimports];
     snprintf(sl->name, sizeof sl->name, "%s", name);
     sl->fn = fn;
     uint32_t magic = IMPORT_BASE + g_nimports * 16;
     register_function(magic, fn);
-    g_nimports++;
+    __atomic_store_n(&g_nimports, g_nimports + 1, __ATOMIC_RELEASE);   /* import_name() reads it unlocked */
+    pthread_mutex_unlock(&g_imports_lock);
     return magic;
 }
 
@@ -330,6 +343,7 @@ int load_image(const char *path, LoadedImage *out) {
         for (uint32_t k = 0;; k++) {
             uint32_t thunk = R32(image_base + ilt + 4 * k);
             if (!thunk) break;
+            if (g_nimports >= MAX_IMPORTS) { fprintf(stderr, "%s: more than %d imports\n", path, MAX_IMPORTS); free(file); return -1; }
             ImportSlot *s = &g_imports[g_nimports];
             if (thunk & 0x80000000u)
                 snprintf(s->name, sizeof s->name, "%s!#%u", dll, thunk & 0xffff);

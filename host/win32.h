@@ -45,7 +45,10 @@ uint32_t heap_alloc(uint32_t size, int zero);
 void heap_free(uint32_t a);
 uint32_t heap_realloc(uint32_t a, uint32_t size, int zero);
 uint32_t heap_size(uint32_t a);
-uint32_t guest_valloc(uint32_t size);              /* page-granular, zero-filled */
+uint32_t guest_valloc(uint32_t size);              /* page-granular, zero-filled; 0 when the window is full */
+enum { VA_ALLOC = 1, VA_VIEW, VA_STACK };          /* what a VirtualAlloc-window region holds */
+uint32_t guest_valloc_as(uint32_t size, int kind);
+int guest_vfree(uint32_t base, int kind);          /* gives a region back by its base; 0 if it isn't one */
 uint32_t guest_strdup(const char *s);
 
 /* ------------------------------------------------------------------ handles */
@@ -80,6 +83,7 @@ typedef struct GuestThread {
     uint32_t tib;
     uint32_t tls[64];
     uint32_t last_error;
+    uint32_t stack;      /* base of its guest stack (VA_STACK region; 0 for the main thread) */
 } GuestThread;
 extern __thread GuestThread *t_self;
 GuestThread *thread_main_init(CPU *c);
@@ -107,6 +111,7 @@ int on_game_thread(void);         /* the game's main thread (the one that runs W
 void sched_main_init(void);                       /* on the game's thread, before it starts */
 void *sched_new(const char *name, int (*start)(void *), void *arg);   /* by the creator; NULL when off */
 void sched_enter(void *rec);                      /* first thing on the new host thread */
+void sched_drop(void *rec);                       /* its host thread never started */
 void sched_exit(void);
 void sched_yield_det(void);
 int sched_wait(int (*pred)(void *), void *arg, uint64_t deadline_us, uint64_t (*deadline_fn)(void));

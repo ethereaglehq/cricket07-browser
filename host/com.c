@@ -38,6 +38,7 @@ static uint32_t build_vtable(ComInterface *it) {
         char name[128];
         snprintf(name, sizeof name, "%s::%s", it->name, it->methods[i].name);
         uint32_t magic = add_dynamic_import(name, com_dispatch);
+        if (!magic) continue;   /* import table full (logged): a call through this entry traps */
         uint32_t slot = (magic - IMPORT_BASE) / 16;
         g_slots[slot].it = it;
         g_slots[slot].idx = i;
@@ -85,9 +86,9 @@ void com_AddRef(CPU *c) {
     RET(1, o ? (uint32_t)++o->refs : 1);
 }
 
-void com_Release(CPU *c) {
-    ComObj *o = com_get(THIS);
-    if (!o) RET(1, 0);
+int com_live_objects(void) { return g_nobjs - 1 - g_nfree; }   /* for the [mem] log */
+
+static int32_t release(ComObj *o) {
     int32_t r = --o->refs;
     if (r <= 0 && !o->iface->destroy) o->refs = r = 0;  /* singletons (devices, interfaces): keep alive */
     else if (r <= 0) {
@@ -103,5 +104,17 @@ void com_Release(CPU *c) {
         g_free_idx[g_nfree++] = (int)(o - g_objs);
         pthread_mutex_unlock(&g_com_lock);
     }
-    RET(1, (uint32_t)r);
+    return r;
+}
+
+void com_Release(CPU *c) {
+    ComObj *o = com_get(THIS);
+    if (!o) RET(1, 0);
+    RET(1, (uint32_t)release(o));
+}
+
+/* A reference the host holds (a texture's on its level surfaces) going away. */
+int com_release(uint32_t guest) {
+    ComObj *o = com_get(guest);
+    return o ? release(o) : 0;
 }
