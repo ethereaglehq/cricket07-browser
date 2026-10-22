@@ -106,7 +106,10 @@ play also start the room server (`cd server && npx wrangler dev --var NETPLAY_SE
 - **Online play is lockstep.** A deterministic scheduler (`host/sched.c`) runs one game thread at a
   time on a virtual clock, so a match depends only on its inputs. Each frame, both games wait for both
   players' inputs and apply them together (`host/netplay.c`), and they compare a hash of the game's
-  memory every few frames to catch any drift.
+  memory every few frames to catch any drift. Each player's inputs are sent a few frames ahead, and how
+  far adapts during the match: each game times how early the other's inputs arrive and reports back
+  (`web/netplay.js`). `tests/netplay/run.sh` plays two simulated players over a jittery network to check
+  it; `node tests/web/run.js` tests the page against a stand-in engine.
 - **Recompiled functions keep registers in local variables** and write them back only around calls,
   which made the build about 30% faster and the WebAssembly file about a quarter smaller.
 - **Translation is tested against the original.** `tests/difftest.py` runs each function in a CPU

@@ -40,10 +40,11 @@ function makeGameFolder(extra = {}) {
   return g;
 }
 
-async function player(browser, url, name = 'player', contextOptions = {}) {
+async function player(browser, url, name = 'player', init = null, contextOptions = {}) {
   const ctx = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 860 },
     ignoreHTTPSErrors: !!process.env.BASE_URL, ...contextOptions });
   await ctx.addInitScript(STUB_GPU);
+  for (const script of [init].flat()) if (script) await ctx.addInitScript(script);
   const page = await ctx.newPage();
   page.logs = [];
   page.on('console', (m) => { page.logs.push(m.text()); if (process.env.VERBOSE) console.log(`  [${name}] ${m.text()}`); });
@@ -545,17 +546,19 @@ test('patches: a patch may not overwrite the page\'s own marker file', async ({ 
   assert.match(plan, /\.installed\.json \(a name this page uses itself\)/);
 });
 
-// A host and a guest in a room, the match started. options: more URL options for both, e.g. 'watchdog=2&'.
-async function startOnline(browser, base, netplay, options = '') {
-  const q = `?${options}netplay=${encodeURIComponent(netplay)}`;
-  const host = await player(browser, base + q, 'host');
+// Host and guest meet in a room and the host starts the game. Options: query (added to both pages' URLs, or
+// one per player as [host's, guest's]), init (scripts for both pages, as for player()).
+async function startOnline({ browser, base, netplay }, { query = '', init = null } = {}) {
+  const [hq, gq] = Array.isArray(query) ? query : [query, query];
+  const np = `netplay=${encodeURIComponent(netplay)}`;
+  const host = await player(browser, `${base}?${np}${hq}`, 'host', init);
   await install(host);
   await host.click('#go-online');
   await host.fill('#np-name', 'Host');
   await host.click('#np-host');
   await host.waitForSelector('#view-lobby:not(.hidden)');
   const code = (await host.textContent('#np-room')).trim();
-  const guest = await player(browser, `${base}?${options}join=${code}&netplay=${encodeURIComponent(netplay)}`, 'guest');
+  const guest = await player(browser, `${base}?join=${code}&${np}${gq}`, 'guest', init);
   await install(guest);
   await guest.fill('#np-name', 'Guest');
   await guest.click('#np-join');
@@ -563,16 +566,123 @@ async function startOnline(browser, base, netplay, options = '') {
   await host.waitForFunction(() => !document.getElementById('np-start').disabled);
   await sleep(1500);   // a few pings, for the auto delay
   await host.click('#np-start');
-  return { host, guest };
+  return [host, guest];
+}
+const netInfo = (page) => page.evaluate(() => window.recomp._test_info().net);
+async function noDesync(players) {
+  for (const [i, p] of players.entries()) assert.strictEqual((await netInfo(p)).desync, 0, `${i ? 'guest' : 'host'} saw a desync`);
+}
+// Polls the players' input delays until ok(delays) holds, and returns them.
+async function delaysUntil(players, what, ok, ms) {
+  const t0 = Date.now();
+  for (;;) {
+    const d = await delays(players);
+    if (ok(d)) return d;
+    if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what} (delays now ${d})`);
+    await sleep(250);
+  }
 }
 
-test('online: two players stay in lockstep', async ({ browser, base, netplay }) => {
-  const { host, guest } = await startOnline(browser, base, netplay);
+test('online: two players stay in lockstep', async (env) => {
+  const [host, guest] = await startOnline(env);
   await Promise.all([waitFrames(host, 300, 30000), waitFrames(guest, 300, 30000)]);
-  const [a, b] = await Promise.all([host, guest].map((p) => p.evaluate(() => window.recomp._test_info())));
-  assert.strictEqual(a.net.desync, 0, 'host saw a desync');
-  assert.strictEqual(b.net.desync, 0, 'guest saw a desync');
+  await noDesync([host, guest]);
   assert.match(await host.textContent('#netstatus'), /Online · player 1 of 2/);
+}, { online: true });
+
+// A bad connection for the online tests (an init script): everything the page sends waits window.__net.base
+// ms plus up to window.__net.jitter ms first (both can change mid-game). The jitter holds for 50 ms at a time,
+// as on a busy Wi-Fi link, so the repeats of a late input in the next direct packets are late too. The room's
+// WebSocket keeps its order, as TCP does (a late message holds back the ones after it); the direct channels
+// don't. On a page opened with &legacy, the game messages look like an older version's: no lead on its inputs
+// and no reports, which an older netplay.js doesn't send.
+function NET_SHAPER() {
+  window.__net = { base: 0, jitter: 0, legacy: new URLSearchParams(location.search).has('legacy') };
+  let slot = -1, r = 0;
+  const delay = () => {
+    const k = Math.floor(performance.now() / 50);
+    if (k !== slot) { slot = k; r = Math.random(); }
+    return window.__net.base + r * window.__net.jitter;
+  };
+  const legacy = (data) => {
+    if (!window.__net.legacy || typeof data !== 'string' || !data.startsWith('{"t":"in"')) return data;
+    const m = JSON.parse(data);
+    return JSON.stringify({ t: 'in', d: m.d.map((e) => e.slice(0, 8)), h: m.h });
+  };
+  const wsSend = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (data) {
+    data = legacy(data);
+    const now = performance.now(), at = Math.max(now + delay(), this.rcAt || 0);
+    this.rcAt = at;
+    if (at <= now) return wsSend.call(this, data);
+    setTimeout(() => { if (this.readyState === 1) wsSend.call(this, data); }, at - now);
+  };
+  const dcSend = RTCDataChannel.prototype.send;
+  RTCDataChannel.prototype.send = function (data) {
+    data = legacy(data);
+    const ms = delay();
+    if (!ms) return dcSend.call(this, data);
+    setTimeout(() => { if (this.readyState === 'open') dcSend.call(this, data); }, ms);
+  };
+}
+const setNet = (players, net) => Promise.all(players.map((p) => p.evaluate((n) => Object.assign(window.__net, n), net)));
+const BAD_NET = { base: 20, jitter: 100 };   // 20-120 ms each way
+const delays = (players) => Promise.all(players.map(async (p) => (await netInfo(p)).delay));
+
+test('online: the input delay rises with jitter and comes back down when it calms', async (env) => {
+  const players = await startOnline(env, { init: NET_SHAPER });
+  await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
+  const calm = await delays(players);
+  await setNet(players, BAD_NET);
+  const t0 = Date.now();
+  const up = await delaysUntil(players, `the delays to rise from ${calm}`, (d) => d.every((x, i) => x >= calm[i] + 2), 20000);
+  const rose = Date.now() - t0;
+  assert.match(await players[0].textContent('#netstatus'), /delay \d+ frames \(\d+ ms(, adjusting)?\) · direct( \((host|srflx|TURN)\))? \d+ ms/);
+  await sleep(3000);
+  const peak = await delays(players);
+  await setNet(players, { base: 0, jitter: 0 });
+  const t1 = Date.now();
+  const down = await delaysUntil(players, `the delays to come down from ${peak}`, (d) => d.every((x, i) => x <= peak[i] - 2), 40000);
+  console.log(`     delays (host, guest): calm ${calm}, ${up} after ${(rose / 1000).toFixed(1)} s of jitter, peak ${peak},` +
+    ` ${down} after ${((Date.now() - t1) / 1000).toFixed(1)} s calm`);
+  await noDesync(players);
+}, { online: true });
+
+test('online: the delay adapts with the room as the only path', async (env) => {
+  // no direct channels (as when WebRTC can't connect): inputs and the reports on them go through the room server
+  const noWebRTC = () => { delete window.RTCPeerConnection; };
+  const players = await startOnline(env, { init: [noWebRTC, NET_SHAPER] });
+  await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
+  assert.match(await players[0].textContent('#netstatus'), /· through the room \d+ ms/);
+  const calm = await delays(players);
+  await setNet(players, BAD_NET);
+  await delaysUntil(players, `the delays to rise from ${calm}`, (d) => d.every((x, i) => x >= calm[i] + 2), 20000);
+  await noDesync(players);
+}, { online: true });
+
+test('online: ?adaptive=0 keeps the delay the game started with', async (env) => {
+  const players = await startOnline(env, { query: '&adaptive=0', init: NET_SHAPER });
+  await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
+  const before = await delays(players);
+  await setNet(players, BAD_NET);
+  await sleep(8000);
+  assert.deepStrictEqual(await delays(players), before);
+  assert.ok((await netInfo(players[0])).stalls + (await netInfo(players[1])).stalls > 0, 'the jitter caused no stalls');
+  await noDesync(players);
+}, { online: true });
+
+test('online: a peer without adaptive delay plays with one that has it', async (env) => {
+  // the guest acts as an older version: it doesn't adapt, and its messages carry no leads or reports
+  const players = await startOnline(env, { query: ['', '&adaptive=0&legacy'], init: NET_SHAPER });
+  await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
+  const before = await delays(players);
+  await setNet(players, BAD_NET);
+  await sleep(8000);
+  // the host hears no reports, so it keeps the session's delay too
+  assert.deepStrictEqual(await delays(players), before);
+  const frames = await Promise.all(players.map(frameOf));
+  await Promise.all(players.map((p, i) => waitFrames(p, frames[i] + 120, 30000)));
+  await noDesync(players);
 }, { online: true });
 
 // ---- when the game stops (web/loader.js)
@@ -650,7 +760,7 @@ test('stops: a trap, a worker error, a lost GPU and an exit each say what happen
 });
 
 test('stops: the watchdog offers Restart and diagnostics when frames stop, and goes when they resume', async ({ browser, base }) => {
-  const page = await player(browser, base + '?watchdog=2&fps', 'player', { permissions: ['clipboard-read', 'clipboard-write'] });
+  const page = await player(browser, base + '?watchdog=2&fps', 'player', null, { permissions: ['clipboard-read', 'clipboard-write'] });
   await install(page);
   await playSolo(page);
   await waitFrames(page, 130);   // two [mem] reports
@@ -696,7 +806,7 @@ test('stops: the watchdog leaves a hidden tab alone', async ({ browser, base }) 
 });
 
 test('online: the watchdog waits for the other player, and flags a stuck game', async ({ browser, base, netplay }) => {
-  const { host, guest } = await startOnline(browser, base, netplay, 'watchdog=2&');
+  const [host, guest] = await startOnline({ browser, base, netplay }, { query: '&watchdog=2' });
   await Promise.all([waitFrames(host, 120, 30000), waitFrames(guest, 120, 30000)]);
   await guest.evaluate(() => window.recomp._test_hang());   // the guest's game freezes; the host waits for its input
   await guest.waitForSelector('#halt:not(.hidden)', { timeout: 8000 });

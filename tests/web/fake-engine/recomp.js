@@ -57,8 +57,9 @@ async function createRecomp(opts) {
   const net = ENV.RC_NETPLAY && ENV.RC_DETERMINISTIC ? {
     players: Number(ENV.RC_NP_PLAYERS || 2), slot: Number(ENV.RC_NP_SLOT || 0), delay: Number(ENV.RC_NP_DELAY || 4),
     warmup: Number(ENV.RC_NP_DELAY || 4), lastSent: 0, inputs: [], left: [], out: [], popped: Array(10).fill(0),
-    myHash: new Map(), theirHash: [], desync: 0, waitMs: 0, stalls: 0, waitingSince: 0,
+    myHash: new Map(), theirHash: [], desync: 0, waitMs: 0, stalls: 0, waitingSince: 0, ranAt: 0,
   } : null;
+  const FRAME_MS = 1000 / 60, NO_SLACK = -2147483648;
   if (net) for (let s = 0; s < 4; s++) { net.inputs.push(new Map()); net.left.push(false); net.theirHash.push(new Map()); }
   let local = { buttons: 0, axis: [0, 0, 0, 0] }, pressed = 0;
   const pads = [];
@@ -74,7 +75,8 @@ async function createRecomp(opts) {
   }
   const have = (s, f) => f <= net.warmup || net.left[s] || net.inputs[s].has(f);
 
-  // At Present `frame`: our input for frame + D (and, if D grew, for the frames in between), then a hash.
+  // At Present `frame`: our input for frame + D (and, if D grew, for the frames in between; nothing if D shrank
+  // and that frame went out already), each with how far ahead it went out, then a hash.
   function present() {
     if (!net) return;
     const target = frame + net.delay;
@@ -83,7 +85,7 @@ async function createRecomp(opts) {
       pressed = 0;
       for (let f = Math.max(net.lastSent + 1, net.warmup + 1); f <= target; f++) {
         net.inputs[net.slot].set(f, { buttons, axis: [...local.axis] });
-        push([1, net.slot, f, buttons, ...local.axis, net.slot === 0 ? 16667 : 0, 0]);
+        push([1, net.slot, f, buttons, ...local.axis, net.slot === 0 ? 16667 : 0, f - frame]);
       }
       net.lastSent = target;
     }
@@ -123,6 +125,7 @@ async function createRecomp(opts) {
         for (const a of e ? e.axis : [0, 0, 0, 0]) mix(a);
         net.inputs[s].delete(next - 512);
       }
+      net.ranAt = performance.now();
     } else for (const p of pads) mix(p.buttons);
     frame = next;
     present();
@@ -190,9 +193,16 @@ async function createRecomp(opts) {
       return 1;
     },
     _netplay_msg: (i) => (net && i >= 0 && i < 10 ? net.popped[i] | 0 : 0),
+    // Like host/netplay.c: how early the input came (ms before it's needed, negative if the stand-in was already
+    // waiting for it), or NO_SLACK for a repeat or a frame already played. The stand-in runs a frame per
+    // animation frame, so it needs frame + 1 at the first one after the last frame it ran.
     _netplay_remote_input(s, f, b, lx, ly, rx, ry) {
-      if (!net || s < 0 || s >= net.players || s === net.slot) return;
+      if (!net || s < 0 || s >= net.players || s === net.slot || net.inputs[s].has(f) || f <= frame) return NO_SLACK;
       net.inputs[s].set(f, { buttons: b, axis: [lx, ly, rx, ry] });
+      if (!frame) return NO_SLACK;
+      const now = performance.now();
+      const need = (net.waitingSince || Math.max(now, net.ranAt + FRAME_MS)) + (f - frame - 1) * FRAME_MS;
+      return Math.trunc(need - now);
     },
     _netplay_remote_hash(s, f, lo, hi) {
       if (!net || s < 0 || s >= 4) return;
@@ -200,8 +210,8 @@ async function createRecomp(opts) {
       check(s, f);
     },
     _netplay_player_left(s) { if (net && s >= 0 && s < 4) net.left[s] = true; },
-    _netplay_status: (what) => (!net ? 0 : what === 0 ? frame : what === 1 ? Math.round(net.waitMs) : what === 2 ? net.desync
-      : what === 4 ? (net.waitingSince ? 1 : 0) : net.stalls),
+    // host/netplay.c's netplay_status: frame, ms waited, desync frame, stalls, blocked on input now, delay now
+    _netplay_status: (what) => (!net ? 0 : [frame, Math.round(net.waitMs), net.desync, net.stalls, net.waitingSince ? 1 : 0, net.delay][what] ?? 0),
     _netplay_set_delay(d) { if (net && d >= 1 && d <= 60) net.delay = d; },
 
     async _test_save(rel, text) { await writeFile(user, [...DOCS, rel].join('/'), text); },
