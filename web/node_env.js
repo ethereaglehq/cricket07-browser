@@ -8,7 +8,8 @@ Module.preRun.push(() => {
 
 // Netplay harness: RC_NP_URL=ws://.../netplay/<CODE>?ticket=... joins a room (web/netplay.js) and holds
 // main() back until the host starts the session; RC_NP_HOST=<n> makes this peer the one that starts it
-// once n players are in. RC_NP_DELAY (frames, or auto: the default) is the input delay the host asks for.
+// once n players are in. RC_NP_DELAY (frames, or auto: the default) is the input delay the host asks for;
+// RC_NP_ADAPTIVE=0 keeps it all game instead of adapting it to the connection.
 if (process.env.RC_NP_URL) {
   const np = require(require('path').join(__dirname, '../../web/netplay.js'));
   const want = Number(process.env.RC_NP_HOST || 0);
@@ -19,6 +20,7 @@ if (process.env.RC_NP_URL) {
       url: process.env.RC_NP_URL,
       name: process.env.RC_NP_NAME || 'node',
       version: process.env.RC_NP_VERSION || 'test',
+      adaptive: process.env.RC_NP_ADAPTIVE !== '0',
       onLobby(l) {
         console.error(`[netplay] lobby: you are player ${l.you}, ${l.players.length} in the room`);
         // RC_NP_DELAY=auto (default) waits until every player has reported a round trip to the room

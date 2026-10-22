@@ -17,6 +17,12 @@
  * Every NP_HASH_EVERY frames each peer also sends a hash of the game's global data; a mismatch means the
  * simulations diverged (desync) and is reported.
  *
+ * The delay can change mid-game (netplay_set_delay; web/netplay.js adapts it to how early our inputs
+ * reach the others). Inputs are keyed by frame, so each peer changes how far ahead it sends its own without
+ * asking anyone: a longer delay also sends the frames in between (repeating the current sample), a shorter
+ * one sends nothing until f + D passes the last frame already sent. Either way every frame gets exactly one
+ * input. The neutral warm-up stays keyed to the delay the session started with.
+ *
  * Inputs from the transport arrive on another host thread (the page's main thread), so each buffer entry
  * carries the frame it holds, published with release/acquire ordering; the game thread sleeps on a futex
  * that every delivery wakes. Outgoing messages wake the page's pump the same way (an async main-thread
@@ -46,11 +52,14 @@ typedef struct { uint32_t kind, slot, frame, buttons; int32_t axis[4]; uint32_t 
 enum { MSG_INPUT = 1, MSG_HASH = 2 };
 
 static int g_np = -1;                       /* netplay on */
-static int g_np_players, g_np_slot, g_np_delay;
+static int g_np_players, g_np_slot, g_np_delay;   /* g_np_delay: the session's delay (frames 1..D are neutral) */
+static int g_np_lead;                       /* the delay our inputs are sent with now */
+static int g_np_want;                       /* the page's choice (netplay_set_delay), applied at the next Present */
+static uint32_t g_last_sent;                /* last frame our input went out for */
 static NpInput g_in[NP_SLOTS][NP_RING];
 static int g_left[NP_SLOTS];                /* peer gone: its pad reads neutral from then on */
 static NpInput g_local;                     /* latest physical/scripted state of the local pad */
-static uint32_t g_local_pressed;            /* buttons pressed since the last Present (see netplay_frame) */
+static uint32_t g_local_pressed;            /* buttons pressed since the last sample sent (see netplay_frame) */
 static pthread_mutex_t g_local_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define OUTBOX 1024
@@ -63,9 +72,11 @@ static uint32_t g_in_seq;                   /* bumped whenever remote input land
 static uint64_t g_my_hash[NP_HASHES]; static uint32_t g_my_hash_frame[NP_HASHES];
 static uint32_t g_desync_frame;             /* first frame found to differ (0 = none) */
 static uint32_t g_frame;                    /* last frame processed */
+static uint64_t g_present_us;               /* when the last Present began (host clock, us), and whether it is */
+static int g_waiting;                       /* still waiting for the next frame's inputs (for arrival_slack) */
 static uint32_t g_wait_ms;                  /* time spent waiting for remote input, for the page's status line */
 static uint32_t g_stalls;                   /* frames that waited over 10 ms for remote input (the delay didn't cover it) */
-static uint32_t g_waiting;                  /* the game thread is waiting for remote input now */
+static uint32_t g_blocked;                  /* the game thread is blocked on remote input now (the watchdog's "waiting") */
 static uint32_t g_frame_dt_us = 16667;      /* game time for the next frame (see top) */
 int netplay_on(void);
 uint32_t netplay_frame_dt_us(void) { return netplay_on() ? g_frame_dt_us : 0; }
@@ -87,6 +98,8 @@ int netplay_on(void) {
             }
             fprintf(stderr, "[netplay] %d players, local slot %d, input delay %d frames\n", g_np_players, g_np_slot,
                     g_np_delay);
+            g_np_lead = g_np_delay;
+            g_last_sent = (uint32_t)g_np_delay;   /* frames up to the delay are neutral: never sent */
         }
     }
     return g_np;
@@ -153,32 +166,55 @@ static struct { uint32_t frame; int slot; uint64_t hash; } g_pending[NP_SLOTS][N
 /* Called at every Present on the game thread, with the frame just presented and a hash of global state. */
 void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
     if (!netplay_on()) return;
-    g_frame = frame;
-    /* our input for frame + D */
-    NpMsg m = { MSG_INPUT, (uint32_t)g_np_slot, frame + (uint32_t)g_np_delay, 0, { 0 }, 0, 0 };
-    /* A button pressed and released since the last Present still counts as held for this frame: the pad
-       is only sampled here, once a frame, so a quick tap between two samples would otherwise be lost (and
-       the slower the game runs, the more taps fall between samples). */
-    pthread_mutex_lock(&g_local_lock);
-    m.buttons = g_local.buttons | g_local_pressed;
-    g_local_pressed = 0;
-    for (int i = 0; i < 4; i++) m.axis[i] = g_local.axis[i];
-    pthread_mutex_unlock(&g_local_lock);
+    double t_present = host_seconds();
+    /* from here until the wait below ends, frame + 1's inputs are needed (for arrival_slack, on other threads) */
+    __atomic_store_n(&g_present_us, (uint64_t)(t_present * 1e6), __ATOMIC_RELAXED);
+    __atomic_store_n(&g_waiting, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_frame, frame, __ATOMIC_RELEASE);
+    int want = __atomic_load_n(&g_np_want, __ATOMIC_ACQUIRE);
+    if (want && want != g_np_lead) {
+        fprintf(stderr, "[netplay] input delay %d -> %d frames (frame %u)\n", g_np_lead, want, frame);
+        __atomic_store_n(&g_np_lead, want, __ATOMIC_RELAXED);
+    }
+    uint32_t dt_us = 0;
     if (g_np_slot == 0) {   /* the host's real frame time, for the frame this input belongs to */
         static double last;
-        double now = host_seconds();
-        double dt = last ? now - last : 1.0 / 60;
-        last = now;
+        double dt = last ? t_present - last : 1.0 / 60;
+        last = t_present;
         if (dt < 0.004) dt = 0.004;     /* high-refresh displays present more often: still real time */
         if (dt > 0.033) dt = 0.033;     /* a longer gap (a stall, or under 30 fps) briefly slows the game down rather
                                            than jumping ahead: a slowdown reads as "lag", a jump as broken */
-        m.hash_lo = (uint32_t)(dt * 1e6);
+        dt_us = (uint32_t)(dt * 1e6);
     }
-    store_input(g_np_slot, m.frame, m.buttons, m.axis, m.hash_lo);
-    outbox_push(&m);
-    static int log_input = -1;   /* RC_NP_LOG_INPUT=1: log every non-neutral input this player sends */
-    if (log_input < 0) log_input = getenv("RC_NP_LOG_INPUT") != NULL;
-    if (log_input && m.buttons) fprintf(stderr, "[netplay] sent buttons %x for frame %u\n", m.buttons, m.frame);
+    /* our input for frame + D. If D just grew, the frames in between get the same sample; if it shrank, nothing
+       goes out until frame + D passes the last frame sent (taps wait in g_local_pressed for the next sample). */
+    uint32_t first = g_last_sent + 1, target = frame + (uint32_t)g_np_lead;
+    /* Each input says how far ahead it went out, so the others can time its arrival. Not after a slow frame of
+       ours (over 50 ms between getting the inputs and the next Present: a load, say): that input leaves late
+       through no fault of the network, and 0 tells the others not to count it. */
+    static double wait_end;
+    int slow = wait_end && t_present - wait_end > 0.05;
+    if (target >= first) {
+        NpMsg m = { MSG_INPUT, (uint32_t)g_np_slot, 0, 0, { 0 }, dt_us, 0 };
+        /* A button pressed and released since the last sample still counts as held for this one: the pad
+           is only sampled here, once a frame, so a quick tap between two samples would otherwise be lost (and
+           the slower the game runs, the more taps fall between samples). */
+        pthread_mutex_lock(&g_local_lock);
+        m.buttons = g_local.buttons | g_local_pressed;
+        g_local_pressed = 0;
+        for (int i = 0; i < 4; i++) m.axis[i] = g_local.axis[i];
+        pthread_mutex_unlock(&g_local_lock);
+        for (uint32_t f = first; f <= target; f++) {
+            m.frame = f;
+            m.hash_hi = slow ? 0 : f - frame;
+            store_input(g_np_slot, f, m.buttons, m.axis, dt_us);
+            outbox_push(&m);
+        }
+        g_last_sent = target;
+        static int log_input = -1;   /* RC_NP_LOG_INPUT=1: log every non-neutral input this player sends */
+        if (log_input < 0) log_input = getenv("RC_NP_LOG_INPUT") != NULL;
+        if (log_input && m.buttons) fprintf(stderr, "[netplay] sent buttons %x for frames %u-%u\n", m.buttons, first, target);
+    }
     /* test only: RC_NP_PERTURB=<frame> flips a byte of the game's globals here, to check desync detection */
     static int perturb = -1;
     if (perturb < 0) perturb = getenv("RC_NP_PERTURB") ? atoi(getenv("RC_NP_PERTURB")) : 0;
@@ -199,7 +235,7 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
         uint32_t seq = __atomic_load_n(&g_in_seq, __ATOMIC_ACQUIRE);   /* before the check: a delivery in between wakes us */
         int all = 1;
         for (int s = 0; s < g_np_players; s++) if (!have_input(s, next)) { all = 0; break; }
-        __atomic_store_n(&g_waiting, !all, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_blocked, !all, __ATOMIC_RELAXED);
         if (all) break;
 #ifdef __EMSCRIPTEN__
         emscripten_futex_wait(&g_in_seq, seq, 2.0);   /* woken by inputs_changed(); the timeout is a safety net */
@@ -210,7 +246,9 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
         double now = host_seconds();
         if (now - last_note > 5) { last_note = now; fprintf(stderr, "[netplay] waiting for players (frame %u, %.0f s)\n", next, now - t0); }
     }
-    double waited = host_seconds() - t0;
+    __atomic_store_n(&g_waiting, 0, __ATOMIC_RELEASE);
+    wait_end = host_seconds();
+    double waited = wait_end - t0;
     g_wait_ms += (uint32_t)(waited * 1000);
     if (waited > 0.010) g_stalls++;
     /* every 10 s: how the lockstep is doing (the page's console, or stderr headless) */
@@ -219,8 +257,8 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
     if (waited > worst) worst = waited;
     if (frame % 600 == 0) {
         double now = host_seconds();
-        if (period_t0) fprintf(stderr, "[netplay] frame %u: %.1f fps, %u stalls (worst %.0f ms), waited %u ms in all\n", frame,
-                               600 / (now - period_t0), g_stalls - period_stalls, worst * 1000, g_wait_ms);
+        if (period_t0) fprintf(stderr, "[netplay] frame %u: %.1f fps, %u stalls (worst %.0f ms), waited %u ms in all, delay %d\n",
+                               frame, 600 / (now - period_t0), g_stalls - period_stalls, worst * 1000, g_wait_ms, g_np_lead);
         period_t0 = now; period_stalls = g_stalls; worst = 0;
     }
     /* apply every player's pad for the next frame */
@@ -248,7 +286,8 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
 /* ------------------------------------------------------------------ transport side (any thread) */
 
 /* Next outgoing message: netplay_pop() loads it (0 if none), netplay_msg(i) reads its fields: kind, slot,
-   frame, buttons, axes x4, hash lo, hash hi. (Fields by call, so the transport needs no view of wasm memory.) */
+   frame, buttons, axes x4, hash lo, hash hi (an input's frame time, and how many frames ahead it was sent).
+   (Fields by call, so the transport needs no view of wasm memory.) */
 static uint32_t g_popped[10];
 EXPORT int netplay_pop(void) {
     uint32_t r = g_out_r;
@@ -262,12 +301,38 @@ EXPORT int netplay_pop(void) {
 }
 EXPORT int32_t netplay_msg(int i) { return i >= 0 && i < 10 ? (int32_t)g_popped[i] : 0; }
 
-EXPORT void netplay_remote_input(int slot, uint32_t frame, uint32_t buttons, int lx, int ly, int rx, int ry,
-                                 uint32_t dt_us) {
-    if (!netplay_on() || slot < 0 || slot >= g_np_players || slot == g_np_slot) return;
+/* How early a remote input for `frame` arrives: ms before this game needs it, negative when it has already been
+   waiting that long. Waiting at Present g, it has needed frame g + 1 since that Present began; past the wait it
+   needs g + 2 at its next Present, about a frame later (or any moment, in a slow frame such as a load); later
+   frames follow a frame apart. web/netplay.js turns these into the reports that set each sender's delay. */
+#define NP_FRAME_US 16667
+#define NP_NO_SLACK INT32_MIN
+static int32_t arrival_slack(uint32_t frame) {
+    uint32_t g = __atomic_load_n(&g_frame, __ATOMIC_ACQUIRE);
+    int waiting = __atomic_load_n(&g_waiting, __ATOMIC_RELAXED);
+    int64_t tp = (int64_t)__atomic_load_n(&g_present_us, __ATOMIC_RELAXED), now = (int64_t)(host_seconds() * 1e6);
+    uint32_t first = g + (waiting ? 1 : 2);   /* the next frame it will wait for */
+    if (!g || (int32_t)(frame - first) < 0 || frame - first > 600) return NP_NO_SLACK;   /* not started, or played */
+    int64_t need = waiting ? tp : now > tp + NP_FRAME_US ? now : tp + NP_FRAME_US;
+    return (int32_t)((need + (int64_t)(frame - first) * NP_FRAME_US - now) / 1000);
+}
+
+/* Returns how early the input arrived (arrival_slack), or NP_NO_SLACK if it was here already: inputs come over
+   two paths, and every direct packet repeats the last few. */
+EXPORT int32_t netplay_remote_input(int slot, uint32_t frame, uint32_t buttons, int lx, int ly, int rx, int ry,
+                                    uint32_t dt_us) {
+    if (!netplay_on() || slot < 0 || slot >= g_np_players || slot == g_np_slot) return NP_NO_SLACK;
+    if (__atomic_load_n(&g_in[slot][frame % NP_RING].frame, __ATOMIC_ACQUIRE) == frame) return NP_NO_SLACK;
+    int32_t slack = arrival_slack(frame);   /* before storing it: the game thread may take it and move on at once */
     const int32_t axis[4] = { lx, ly, rx, ry };
     store_input(slot, frame, buttons, axis, dt_us);
     inputs_changed();
+    return slack;
+}
+
+/* The delay to send our inputs with, from the next Present on (web/netplay.js adapts it); any thread. */
+EXPORT void netplay_set_delay(int frames) {
+    if (frames >= 1 && frames <= 60) __atomic_store_n(&g_np_want, frames, __ATOMIC_RELEASE);
 }
 
 EXPORT void netplay_remote_hash(int slot, uint32_t frame, uint32_t lo, uint32_t hi) {
@@ -288,7 +353,16 @@ EXPORT void netplay_player_left(int slot) {
 }
 
 /* For the page's status line: last frame, total ms spent waiting for others, first desync frame, stalls, and
-   whether the game is waiting for other players' input right now (the page's watchdog leaves that alone). */
+   whether the game is waiting for other players' input right now (the page's watchdog leaves that alone), and
+   the delay our inputs go out with now. */
 EXPORT uint32_t netplay_status(int what) {
-    return what == 0 ? g_frame : what == 1 ? g_wait_ms : what == 2 ? g_desync_frame : what == 4 ? g_waiting : g_stalls;
+    switch (what) {
+    case 0: return __atomic_load_n(&g_frame, __ATOMIC_RELAXED);
+    case 1: return g_wait_ms;
+    case 2: return g_desync_frame;
+    case 3: return g_stalls;
+    case 4: return __atomic_load_n(&g_blocked, __ATOMIC_RELAXED);
+    case 5: return (uint32_t)__atomic_load_n(&g_np_lead, __ATOMIC_RELAXED);
+    default: return 0;
+    }
 }

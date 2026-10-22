@@ -10,6 +10,8 @@
 //              ?netplay=<url> (the room server for online play, see server/; default: this page's origin)
 //              ?join=<room code>
 //              ?watchdog=N (seconds without a new frame before the page offers a restart, default 15; 0: never)
+//              ?adaptive=0 (online: keep the input delay the game started with, instead of adapting it to
+//              the connection as it goes)
 //
 // Online play (netplay.js, host/netplay.c): players meet in a room on the server; when the host starts,
 // every page boots the game in deterministic lockstep mode with fresh saves, and only pad inputs travel.
@@ -886,6 +888,7 @@ function setupOnline() {
     const left = new Set();
     const me = client = RcNetplay.connect({
       url, name, version, reconnectUrl: roomUrl, iceServers, relayOnly: params.get('turn') === 'only',
+      adaptive: params.get('adaptive') !== '0',
       onReconnect(state) { if (session) session.reconnecting = state === 'connecting'; },
       onFiles(done, size, ok) {
         msg(ok ? 'The host’s saves arrived: this match starts from them.' : `Receiving the host’s saves… ${Math.round(done * 100)}%`);
