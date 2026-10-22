@@ -151,7 +151,8 @@ rm -rf "$DATA/server" && cp -r "$DIR/repo/server" "$DATA/server"
 # the ticket secret is made once and kept; it stays out of the command line (ps) and the repo, and every copy is
 # readable by its owner alone from the moment it's written
 [ -f "$ETC/netplay-secret" ] || (umask 077 && openssl rand -hex 32 >"$ETC/netplay-secret")
-(umask 077 && printf 'NETPLAY_SECRET=%s\nALLOWED_ORIGINS=https://%s\n' "$(cat "$ETC/netplay-secret")" "$DOMAIN" >"$DATA/server/.dev.vars")
+# pages that may use the room server: this site, and the desktop app (desktop/, app://cricket07)
+(umask 077 && printf 'NETPLAY_SECRET=%s\nALLOWED_ORIGINS=https://%s,app://cricket07\n' "$(cat "$ETC/netplay-secret")" "$DOMAIN" >"$DATA/server/.dev.vars")
 mkdir -p "$DATA/rooms" "$DATA/caddy"
 chown -R cricket07: "$DATA"
 chmod 700 "$DATA"

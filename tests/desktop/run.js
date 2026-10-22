@@ -235,8 +235,10 @@ test('a real engine build runs in the app: threads, its files in storage, WebGPU
 
 async function roomServer() {
   const port = 8787 + Math.floor(Math.random() * 500);
+  // allowing the app's origin alone, as the test VM's room server does (deploy/vm/setup.sh)
   const proc = spawn(process.env.WRANGLER || 'wrangler', ['dev', '--local', '--port', String(port), '--var', 'NETPLAY_SECRET:test',
-    '--persist-to', tmp('rooms')], { cwd: path.join(ROOT, 'server'), env: { ...process.env, WRANGLER_SEND_METRICS: 'false' } });
+    '--var', 'ALLOWED_ORIGINS:app://cricket07', '--persist-to', tmp('rooms')],
+  { cwd: path.join(ROOT, 'server'), env: { ...process.env, WRANGLER_SEND_METRICS: 'false' } });
   let out = '';
   proc.stdout.on('data', (d) => { out += d; });
   proc.stderr.on('data', (d) => { out += d; });
