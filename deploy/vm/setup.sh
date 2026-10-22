@@ -12,6 +12,10 @@
 # has a cloud firewall (the VCN's security list) that must allow them: see README.md next to this script.
 # Run it again to update to the newest code of the branch.
 #
+# A VM that already serves other sites on ports 80/443: CRICKET07_LISTEN=127.0.0.1:8017 makes this site plain
+# HTTP on that local address only (no certificate, no firewall change), for the existing web server or a
+# Cloudflare Tunnel to put the domain in front of (it must pass WebSocket upgrades on /netplay/).
+#
 # Testing the script itself: CRICKET07_NO_SYSTEMD=1 starts the two servers in the background instead of as
 # services, and CRICKET07_TLS=internal uses Caddy's own certificate authority (for a name like localhost).
 set -euo pipefail
@@ -112,8 +116,15 @@ chown -R cricket07: "$DATA"
 chmod 600 "$DATA/server/.dev.vars"
 
 say "Web server"
+LISTEN=${CRICKET07_LISTEN:-}
+[ -z "$LISTEN" ] || [[ "$LISTEN" =~ ^127\.0\.0\.1:[0-9]{2,5}$ ]] || die "CRICKET07_LISTEN must look like 127.0.0.1:8017"
+if [ -n "$LISTEN" ]; then SITE="http://:${LISTEN##*:}"; BIND="bind 127.0.0.1"; else SITE=$DOMAIN; BIND=""; fi
 cat >"$ETC/Caddyfile" <<EOF
-$DOMAIN {
+{
+	${LISTEN:+auto_https off}
+}
+$SITE {
+	$BIND
 	${CRICKET07_TLS:+tls $CRICKET07_TLS}
 	encode zstd gzip
 	header {
@@ -145,7 +156,7 @@ if command -v getenforce >/dev/null && [ "$(getenforce)" = Enforcing ]; then
 fi
 if [ -n "${CRICKET07_NO_SYSTEMD:-}" ]; then
   say "Starting (no systemd)"
-  pkill -f "wrangler dev --ip 127.0.0.1 --port 8787" 2>/dev/null || true
+  pkill -f "wrangler.js dev --ip 127.0.0.1 --port 8787" 2>/dev/null || true
   pkill -f "caddy run --config $ETC/Caddyfile" 2>/dev/null || true
   (cd "$DATA/server" && WRANGLER_SEND_METRICS=false CI=1 HOME="$DATA" nohup $WRANGLER_CMD >"$DATA/rooms.log" 2>&1 &)
   (XDG_DATA_HOME="$DATA/caddy" XDG_CONFIG_HOME="$DATA/caddy" nohup /usr/local/bin/caddy run --config "$ETC/Caddyfile" --adapter caddyfile >"$DATA/web.log" 2>&1 &)
@@ -190,7 +201,9 @@ EOF
   systemctl restart cricket07-rooms cricket07-web
 
   say "Firewall (this VM's own)"
-  if command -v firewall-cmd >/dev/null && systemctl is-active -q firewalld; then
+  if [ -n "$LISTEN" ]; then
+    echo "   none: the site only listens on $LISTEN"
+  elif command -v firewall-cmd >/dev/null && systemctl is-active -q firewalld; then
     firewall-cmd -q --permanent --add-service=http --add-service=https && firewall-cmd -q --reload
   elif command -v iptables >/dev/null; then
     # Oracle's Ubuntu images end the INPUT chain with a REJECT: the ports go in front of it
@@ -200,6 +213,14 @@ EOF
 fi
 
 say "Done"
+if [ -n "$LISTEN" ]; then cat <<EOF
+   The test site runs on http://$LISTEN (this VM only). Put https://$DOMAIN in front of it with the web server
+   that owns ports 80/443, or a Cloudflare Tunnel, forwarding everything (WebSocket upgrades included) there.
+   Logs:   journalctl -u cricket07-web -u cricket07-rooms -f
+   Update: run this script again (with the same CRICKET07_LISTEN).
+EOF
+exit 0
+fi
 cat <<EOF
    The test site will be at https://$DOMAIN once:
      - the domain's DNS points at this VM's public IP (Cloudflare: an A record, "DNS only"), and
