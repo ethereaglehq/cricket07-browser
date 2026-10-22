@@ -228,7 +228,10 @@
       // install cut short (a closed tab) is then undone on the next visit (recover) instead of leaving the
       // game half-patched with nothing to remove it by.
       const rec = { id, name: p.name, at: new Date().toISOString(), installing: true, files: [], refused: p.refused.map((r) => r.path) };
-      for (const it of all) rec.files.push({ where: it.where, path: it.dest, replaced: !!(await fileAt(roots[it.where], it.dest)) });
+      for (const it of all) {
+        const was = await fileAt(roots[it.where], it.dest);
+        rec.files.push({ where: it.where, path: it.dest, replaced: !!was, ...(was ? { size: (await was.getFile()).size } : {}) });
+      }
       installed.push(rec);
       await saveList(installed);
       const sums = [];
@@ -269,9 +272,12 @@
         const f = files[k];
         onProgress({ done: k, total: files.length, file: f.path });
         if (!f.replaced) { await removeAt(roots[f.where], f.path); continue; }
+        // A kept original is only whole once its write finished: until then the file exists but is empty. One
+        // that isn't whole means the tab closed before the game's file was touched, so it needs nothing back.
         const orig = await fileAt(keep, `${f.where}/${f.path}`);
-        if (!orig && partial) continue;
-        if (!orig) throw new Error(`The original of ${f.path} is missing, so this patch can't be removed. Choose your game folder again to start clean.`);
+        const whole = orig && (f.size === undefined || (await orig.getFile()).size === f.size);
+        if (!whole && partial) continue;
+        if (!whole) throw new Error(`The original of ${f.path} is missing, so this patch can't be removed. Choose your game folder again to start clean.`);
         await writeAt(roots[f.where], f.path, await orig.getFile());
       }
     }

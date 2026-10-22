@@ -508,7 +508,8 @@ test('patches: an install cut short by closing the tab is undone on the next vis
   await page.waitForFunction(async () => !(await RcPatches.open().list()).length);
   const now = await gameFolder(page);
   delete now['.installed.json']; delete original['.installed.json'];
-  assert.deepStrictEqual(now, original, 'game folder not restored');
+  const diff = [...new Set([...Object.keys(now), ...Object.keys(original)])].filter((k) => now[k] !== original[k]);
+  assert.deepStrictEqual(diff, [], `game folder not restored: ${diff.map((k) => `${k} (${k in original ? 'changed' : 'extra'})`).join(', ')}`);
   assert.match(await page.textContent('#go-patches'), /^Patches & rosters$/);
 });
 
