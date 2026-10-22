@@ -12,6 +12,11 @@ please report it to whoever runs the site (for this repository: open an issue, o
   when an invite link chose another one) and, for direct connections between players, the STUN/TURN
   servers that room server hands out. Links (credits, source) are only followed if you click them.
 - **Your game folder** is copied into the browser's private storage (OPFS) and never uploaded.
+- **The diagnostics report** (offered when the game stops) holds the browser, GPU and the game's last console
+  lines, without the room code or room server of an online game.
+- **Playing locally** with `web/serve.py`: it answers only requests addressed to this computer (`localhost`, so
+  a web page can't reach it through a name of its own), serves only `web/` and the engine build, and lists no
+  folders.
 
 ## Patches and rosters (`web/patches.js`)
 
@@ -19,7 +24,8 @@ please report it to whoever runs the site (for this repository: open an issue, o
   `.asi`, `.bat`, `.cmd`, `.ps1`, `.vbs`, `.js`, `.jar`, `.sh`, `.msi`, `.lnk`, `.reg`, `.sys` and
   more) and by content (anything that starts like a Windows, Linux or Mac program, or a `#!` script), and
   archives inside a patch are refused too. Nothing installed is ever run by the page; the engine only
-  reads it as game data, inside the browser's sandbox.
+  reads it as game data, inside the browser's sandbox, and refuses heap blocks, sound buffers and textures of
+  sizes nothing could hold (as Windows does) rather than wrapping its own arithmetic on them.
 - **Paths can't escape**: absolute paths, `..`, drive letters, backslashes and control characters are
   refused; everything lands inside the game folder (or, for rosters, the game's saves folder).
 - **Nothing changes before you confirm a plan** that lists every file and what it replaces; every replaced
@@ -39,25 +45,45 @@ please report it to whoever runs the site (for this repository: open an issue, o
 
 ## Online play (`web/netplay.js`, `server/worker.js`)
 
-- Only controller inputs, state checksums, lobby details (the name you type) and, if the host chooses,
-  the host's saves travel between players. Game files never do.
+- Only controller inputs, the mouse's moves and clicks, state checksums, how late each player's inputs
+  arrive (for the adaptive input delay), lobby details (the name you type) and, if the host chooses, the
+  host's saves travel between players. Game files never do.
+- **Everything another player (or a room server) sends is checked** before the game or the page keeps it:
+  inputs and reports only for the slots of the players in the match, frames and delays in range, and only so
+  many held before the game starts. So a hostile peer can't grow the other player's memory or reach the game
+  with input for players that don't exist.
 - **The host's saves** are announced with their size and SHA-256 and checked on arrival: at most 32 MB,
   one bundle at a time, in exactly the chunks the size implies, so a hostile host (or a hostile room
   server) can't flood the other player's memory. The room server only relays saves from the host, before
   the match starts, and at most 160 MB per room.
+- **Direct connections** between players (WebRTC, for the lowest lag) show each player's public IP address to
+  the other, as any peer-to-peer game does. `?turn=only` sends them through the room server's relay instead,
+  which keeps it hidden.
 - Room tickets are signed with a secret only the server knows (`NETPLAY_SECRET`).
 
 ## Hosting a test site (`deploy/vm/setup.sh`)
 
 - Serves the page with the **stand-in engine**, never game files or a game engine build, with a banner
   saying so.
-- Downloads are pinned and verified: Node and Caddy against their publishers' SHA-256/SHA-512 checksums,
-  wrangler at an exact version from npm (whose packages carry integrity hashes).
-- Both servers run as an unprivileged `cricket07` user; the room-server secret is generated on the VM,
-  readable by root and that user only, and kept out of the repository and command lines.
-- Only ports 80 and 443 are opened. HTTPS certificates come from Let's Encrypt (Caddy).
+- **Downloads are pinned:**
+  - Node and Caddy are checked against checksums written in the script. Node's come from its release's signed
+    checksum list (the signature checked against Node's release keys); Caddy's from its release, signed by
+    Caddy's release workflow on GitHub.
+  - wrangler is exactly the packages in `deploy/vm/tools/package-lock.json`, checked against its hashes, and
+    none of their install scripts run.
+  - Everything installed belongs to root.
+- **Both servers run as an unprivileged `cricket07` user in a systemd sandbox:** they can write only to their
+  own state folder, can't see `/home` or gain privileges, and Caddy keeps only the right to listen on 80/443.
+  Caddy's admin API is off.
+- **The room-server secret** is generated on the VM, readable by root and that user only from the moment it's
+  written, and kept out of the repository and command lines.
+- **Only ports 80 and 443 are opened.** Caddy forwards only the room server's own paths to it; its developer
+  tools (`wrangler dev`'s inspector and local explorer) listen on the VM's localhost only, so keep the VM's
+  logins to people you trust. HTTPS certificates come from Let's Encrypt (Caddy), and no other site may frame
+  the page.
 
 ## Tests on GitHub
 
-`.github/workflows/web-tests.yml` runs the tests with GitHub's own actions pinned to exact commits, and
-Playwright and wrangler at exact versions.
+`.github/workflows/web-tests.yml` runs the tests with GitHub's own actions pinned to exact commits, a read-only
+token that isn't left on disk for later steps, Playwright at an exact version, and wrangler from the same
+lockfile as the test VM (no install scripts run).

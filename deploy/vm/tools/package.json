@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "wrangler, which runs the room server (server/) on a test VM (deploy/vm/setup.sh) and in the tests on GitHub. Installed with npm ci --ignore-scripts: exactly the packages in package-lock.json, checked against its hashes, and none of their install scripts run.",
+  "dependencies": {
+    "wrangler": "4.151.3"
+  }
+}

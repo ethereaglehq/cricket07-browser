@@ -18,3 +18,6 @@ ghidra_project/
 .wrangler/
 node_modules/
 .claude/
+
+# npm installs (deploy/vm/tools: wrangler from its lockfile)
+node_modules/
