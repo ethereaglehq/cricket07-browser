@@ -24,12 +24,12 @@ set -euo pipefail
 DOMAIN=${1:?usage: sudo bash deploy/vm/setup.sh <domain> [branch]}
 BRANCH=${2:-main}
 REPO=${CRICKET07_REPO:-https://github.com/ethereaglehq/cricket07-browser}
-NODE_VERSION=22.12.0
+NODE_VERSION=22.23.4
 CADDY_VERSION=2.9.1
-# Node's from nodejs.org/dist/v22.12.0/SHASUMS256.txt (its signature checked against Node's release keys); Caddy's
+# Node's from nodejs.org/dist/v22.23.4/SHASUMS256.txt (its signature checked against Node's release keys); Caddy's
 # from the release's checksums.txt (its signature made by Caddy's release workflow on GitHub)
-NODE_SHA256_x64=22982235e1b71fa8850f82edd09cdae7e3f32df1764a9ec298c72d25ef2c164f
-NODE_SHA256_arm64=8cfd5a8b9afae5a2e0bd86b0148ca31d2589c0ea669c2d0b11c132e35d90ed68
+NODE_SHA256_x64=1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
+NODE_SHA256_arm64=6287aa46b6c375d816e63ae66d024fbbfd70404825aabdfdf898a970871d2f4b
 CADDY_SHA512_amd64=0412057ba591c33bdb66034d7f32209619ce635147dac3084c79abcbc118a761145e695199f57c6798d88fab077f2b0d9cb999f52ded904c6d464a4eba202932
 CADDY_SHA512_arm64=80b917c2bd8aa0892f1386ff97af9e776067dd8cdc4793238869aca7e13f7280f89d1799a1fef08b49af92dbd86684c3ba7a38b9d44afc55ef2eeb33b49e1cbd
 DIR=/opt/cricket07          # code, site and tools (root-owned)
