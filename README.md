@@ -50,6 +50,32 @@ Controls: a game controller, or the keyboard (arrow keys to move, **S** to selec
 cursor). Use `RC_NO_AUDIO=1` to mute the native app, or `?mute` on the page. Both players in an online
 match need the same build and the same game files.
 
+## Saves, patches and rosters
+
+- **Saves** live in the browser's private storage, which a browser may clear (low disk space, clearing
+  site data, or Safari after some days without a visit). The home screen's "Your saves" card downloads
+  a backup (.zip) and restores one, with undo; in Chrome and Edge it can also keep automatic copies in a
+  folder you pick. The game only keeps what you save in My Cricket → Load / Save.
+- **Patches** (kits, faces, stadiums, overlays, bat packs) and **rosters** (`.ros` folders) install from
+  "Patches & rosters": choose the patch's folder or .zip, laid out like the game folder. Only game data is
+  installed, never programs (`.exe`, `.dll`, scripts), so patches that need a modified game executable
+  can't work here. Patches come off again, newest first. A patch that ships as an installer `.exe` can
+  usually be unpacked without running it: The Unarchiver or `innoextract` on a Mac, 7-Zip on Windows.
+- **Online**, both players need the same patches (the lobby says when they differ), and the host can
+  bring their saves, rosters included: every game then starts from the host's saves.
+
+## Testing the page without the game
+
+`tests/web` runs the page in headless Chromium against a stand-in engine (`tests/web/fake-engine`) that
+has the real build's exports, keeps saves where the game does and runs the same lockstep online, so the
+launcher, saves, patches and online play can be tested without any game files:
+
+```bash
+npm i -g playwright            # once; uses its Chromium
+node tests/web/run.js          # all tests; the online ones start the room server with npx wrangler dev
+node tests/web/run.js patches  # only tests whose name contains "patches"
+```
+
 ## Technical notes
 
 - **Memory keeps its original layout.** The executable is loaded at its original address, so every
