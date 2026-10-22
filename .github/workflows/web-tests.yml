@@ -23,6 +23,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: VM script's firewall rules (tests/deploy)
+        run: bash tests/deploy/firewall.sh
+
       # wrangler exactly as the test VM gets it (deploy/vm/tools: the lockfile's packages, checked against its
       # hashes, no install scripts run); Playwright at an exact version (its one dependency is pinned exactly)
       - name: Playwright with its Chromium, and wrangler for the room server

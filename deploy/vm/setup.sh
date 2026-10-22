@@ -38,6 +38,32 @@ ETC=/etc/cricket07
 
 say() { printf '\n== %s\n' "$*"; }
 die() { printf 'setup: %s\n' "$*" >&2; exit 1; }
+# Opens TCP 80 and 443 in a saved iptables ruleset (iptables-save format, loaded at boot): two lines at the top of
+# the filter table's INPUT chain, unless they're there already, and nothing else touched. Not with
+# `netfilter-persistent save`, which writes the whole live ruleset: other programs' rules too (Docker's for the
+# containers running at that moment), which would come back stale at the next boot. tests/deploy/firewall.sh
+persist_ports() {
+  local f=$1 want="" p
+  for p in 80 443; do
+    grep -qE -- "^-A INPUT -p tcp( -m state --state NEW| -m conntrack --ctstate NEW)?( -m tcp)? --dport $p -j ACCEPT\$" "$f" ||
+      want="$want $p"
+  done
+  [ -n "$want" ] || return 0
+  if awk -v ports="$want" '
+      BEGIN { n = split(ports, p, " ") }
+      /^\*filter/ { filter = 1 }
+      filter && !done && (/^-A INPUT / || /^COMMIT/) { for (i = 1; i <= n; i++) print "-A INPUT -p tcp -m tcp --dport " p[i] " -j ACCEPT"; done = 1 }
+      /^COMMIT/ { filter = 0 }
+      { print }
+      END { exit !done }' "$f" >"$f.cricket07-new" && iptables-restore --test <"$f.cricket07-new"; then
+    cp -p "$f" "$f.cricket07-before"   # the file as it was, in case
+    cat "$f.cricket07-new" >"$f"         # in place: its owner, mode and SELinux label stay
+    echo "   added ports$want to $f (the previous version: $f.cricket07-before)"
+  else
+    echo "   couldn't add ports$want to $f: they're open now, but add them there to keep them after a reboot"
+  fi
+  rm -f "$f.cricket07-new"
+}
 [ "$(id -u)" = 0 ] || die "run it with sudo"
 [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "that doesn't look like a domain name: $DOMAIN"
 [[ "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "that doesn't look like a branch name: $BRANCH"
@@ -250,11 +276,19 @@ EOF
   if [ -n "$LISTEN" ]; then
     echo "   none: the site only listens on $LISTEN"
   elif command -v firewall-cmd >/dev/null && systemctl is-active -q firewalld; then
-    firewall-cmd -q --permanent --add-service=http --add-service=https && firewall-cmd -q --reload
+    # now and at boot, without a reload (which can drop other programs' rules, Docker's among them)
+    for svc in http https; do
+      firewall-cmd -q --query-service=$svc || firewall-cmd -q --add-service=$svc
+      firewall-cmd -q --permanent --query-service=$svc || firewall-cmd -q --permanent --add-service=$svc
+    done
+  elif command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null
   elif command -v iptables >/dev/null; then
-    # Oracle's Ubuntu images end the INPUT chain with a REJECT: the ports go in front of it
+    # Oracle's Ubuntu images end the INPUT chain with a REJECT: the ports go in front of it, now ...
     for p in 80 443; do iptables -C INPUT -p tcp --dport $p -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport $p -j ACCEPT; done
-    if command -v netfilter-persistent >/dev/null; then netfilter-persistent save >/dev/null 2>&1 || true; fi
+    # ... and at boot, where the VM loads its rules from /etc/iptables (iptables-persistent, as on Oracle's images)
+    if [ -f /etc/iptables/rules.v4 ]; then persist_ports /etc/iptables/rules.v4
+    else echo "   open now; to keep them after a reboot, add them to whatever loads this VM's firewall rules"; fi
   fi
 fi
 

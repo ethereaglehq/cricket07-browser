@@ -16,7 +16,10 @@ files or a game engine build, and a banner on every page says it's a test site.
 1. **DNS**: point a name at the VM's public IP with an `A` record. On Cloudflare, set it to "DNS only" (grey
    cloud), so Caddy can get its own HTTPS certificate.
 2. **Cloud firewall**: allow TCP 80 and 443 in. On Oracle Cloud, add two ingress rules to the VCN's security list
-   (source `0.0.0.0/0`, TCP, destination ports 80 and 443). The script opens them in the VM's own firewall itself.
+   (source `0.0.0.0/0`, TCP, destination ports 80 and 443). The script opens them in the VM's own firewall itself,
+   with firewalld or ufw where one runs. Otherwise, on Oracle's Ubuntu images, it adds two lines to
+   `/etc/iptables/rules.v4` and changes nothing else there, so other programs' rules, Docker's for example,
+   aren't saved into it.
 3. **Run the script** on the VM:
 
    ```sh
@@ -44,6 +47,10 @@ WebSocket upgrades included (online play uses them on `/netplay/`).
   sudo rm -rf /etc/systemd/system/cricket07-*.service /opt/cricket07 /var/lib/cricket07 /etc/cricket07 /usr/local/bin/caddy
   sudo userdel cricket07
   ```
+
+  The ports stay open in the VM's firewall. To close them, remove the two `--dport 80` / `--dport 443` lines the
+  script added to `/etc/iptables/rules.v4` (or `sudo firewall-cmd --permanent --remove-service=http
+  --remove-service=https`, or `sudo ufw delete allow 80/tcp`, and the same for 443).
 
 ## What it installs
 
