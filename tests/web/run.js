@@ -495,16 +495,23 @@ open(sys.argv[1], 'wb').write(b)`, zip]);
   assert.ok(process.memoryUsage().rss - before < 300e6, 'reader reserved the declared size');
 });
 
-test('patches: an install cut short by closing the tab is undone on the next visit', async ({ browser, base }) => {
-  const page = await player(browser, base);
+// An install that stops for good where a write of `name` begins: the next visit must undo it exactly.
+// The write never finishing is what a tab closed at that moment leaves behind (OPFS writes land on close).
+async function interruptedInstall(browser, base, name) {
+  const page = await player(browser, base, 'player', () => {
+    const create = FileSystemFileHandle.prototype.createWritable;
+    FileSystemFileHandle.prototype.createWritable = function (...a) {
+      return this.name === window.__stopAt ? new Promise(() => {}) : create.apply(this, a);
+    };
+  });
   await install(page);
   const original = await gameFolder(page);
-  // the second file is big enough to still be copying when the page goes away
-  const patch = makePatch('Big', { 'Data/data.gob': 'replaced archive', 'Data/zz-big.fsh': Buffer.alloc(120e6, 7), 'Data/zzz.fsh': 'last' });
-  await planPatch(page, '#patch-folder', patch);
+  await planPatch(page, '#patch-folder', makePatch('Big', { 'Data/data.gob': 'replaced archive', 'Data/zz-new.fsh': 'new', 'Data/zzz.fsh': 'last' }));
+  await page.evaluate((n) => { window.__stopAt = n; }, name);
   await page.click('#patch-install');
-  await page.waitForFunction(() => /Installing [12] of 3/.test(document.getElementById('patch-msg').textContent));
-  await page.reload();   // as if the tab closed mid-install
+  await page.waitForFunction(() => /Installing [0-2] of 3/.test(document.getElementById('patch-msg').textContent));
+  await sleep(300);
+  await page.reload();   // as if the tab closed there
   await page.waitForSelector('#view-home:not(.hidden)');
   await page.waitForFunction(async () => !(await RcPatches.open().list()).length);
   const now = await gameFolder(page);
@@ -512,6 +519,14 @@ test('patches: an install cut short by closing the tab is undone on the next vis
   const diff = [...new Set([...Object.keys(now), ...Object.keys(original)])].filter((k) => now[k] !== original[k]);
   assert.deepStrictEqual(diff, [], `game folder not restored: ${diff.map((k) => `${k} (${k in original ? 'changed' : 'extra'})`).join(', ')}`);
   assert.match(await page.textContent('#go-patches'), /^Patches & rosters$/);
+}
+
+test('patches: an install cut short by closing the tab is undone on the next visit', async ({ browser, base }) => {
+  await interruptedInstall(browser, base, 'zz-new.fsh');   // data.gob already replaced, the next file half made
+});
+
+test('patches: a tab closed while keeping an original leaves the game file alone', async ({ browser, base }) => {
+  await interruptedInstall(browser, base, 'data.gob');     // the kept copy of data.gob exists but is still empty
 });
 
 test('patches and saves: no changes while the game runs in another tab', async ({ browser, base }) => {
