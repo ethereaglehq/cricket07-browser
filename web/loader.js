@@ -280,6 +280,12 @@ async function run(session) {
   $('panel').classList.add('hidden');
   fullscreenTip();
   if (session) await clearNetSaves(session);
+  else {
+    // Ask again for persistent storage, so the browser doesn't evict the saves: Chrome grants it silently
+    // once the site is bookmarked or used often, so a later visit can succeed where the first didn't.
+    navigator.storage.persist?.().catch(() => {});
+    setInterval(() => backupToFolder(false), BACKUP_EVERY_MS);
+  }
   sizeCanvas();
   const script = document.createElement('script');
   script.src = 'build/recomp.js';
@@ -355,9 +361,12 @@ async function boot() {
   };
   const ready = () => {
     show('home');
+    showSaves();
+    backupToFolder(false);   // what the last session saved, if a backup folder is set up and allowed
     if (params.get('join')) goOnline();   // an invite link goes straight to joining
     if (params.has('autoplay')) $('play').click();
   };
+  setupSaves();
   $('play').onclick = () => run().catch(fail);
   $('go-online').onclick = goOnline;
   for (const b of document.querySelectorAll('[data-go]')) b.onclick = () => show(b.dataset.go);
@@ -426,6 +435,103 @@ function fullscreenTip() {
   tip.style.opacity = '1';
   setTimeout(() => { tip.style.opacity = '0'; }, 5000);
   setTimeout(() => tip.classList.add('hidden'), 5500);
+}
+
+// ------------------------------------------------------------------ saves (saves.js)
+
+// The game's saves folder in OPFS: host/main.c puts it beside the game folder (/opfs/<OPFS_DIR>/../userdata).
+// The home screen backs it up (a .zip download, or automatic copies into a folder the player picks) and
+// restores it; while playing solo, the folder copy is refreshed every few minutes.
+const USER_DIR = 'userdata';
+const saves = RcSaves.open(USER_DIR);
+const BACKUP_EVERY_MS = 5 * 60 * 1000;
+
+function when(t) {
+  const d = new Date(t);
+  if (d.toDateString() === new Date().toDateString()) return `today at ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  return `on ${d.toLocaleDateString([], { day: 'numeric', month: 'short' })}`;
+}
+
+function savesMsg(text, undo) {
+  const el = $('saves-msg');
+  el.textContent = text;
+  el.classList.toggle('hidden', !text);
+  if (!undo) return;
+  const b = document.createElement('button');
+  b.className = 'linkish';
+  b.textContent = 'Undo';
+  b.onclick = async () => {
+    try { savesMsg(await saves.undo() ? 'Your earlier saves are back.' : 'Nothing to undo.'); }
+    catch (e) { savesMsg(`Undo failed: ${e.message}`); }
+    showSaves();
+  };
+  el.append(' ', b);
+}
+
+async function showSaves() {
+  const s = await saves.summary().catch(() => ({ files: 0 }));
+  const last = saves.last();
+  $('saves-status').textContent = !s.files ? '· none yet'
+    : `· ${s.files} file${s.files === 1 ? '' : 's'}, ${last ? `backed up ${when(last.at)}` : 'not backed up yet'}`;
+  $('saves-export').disabled = !s.files;
+  if (saves.folderSupported) {
+    const f = await saves.folder();
+    const row = $('saves-folder-row');
+    const link = (text, fn) => { const b = document.createElement('button'); b.className = 'linkish'; b.textContent = text; b.onclick = fn; return b; };
+    row.textContent = '';
+    if (!f) row.append(link('Back up automatically to a folder on this computer', chooseBackupFolder));
+    else if (f.permission === 'granted') row.append(`Automatic backups go to “${f.name}”. `, link('Change folder', chooseBackupFolder));
+    else row.append(link(`Allow automatic backups to “${f.name}”`, () => backupToFolder(true)), ' · ', link('Change folder', chooseBackupFolder));
+    row.classList.remove('hidden');
+  }
+  // Without persistent storage the browser may evict the whole site, saves included (Safari also clears
+  // sites not visited for a while), so say so next to the backup buttons.
+  const kept = await navigator.storage.persisted?.().catch(() => false);
+  $('saves-note').classList.toggle('warn', !kept);
+  $('saves-note').innerHTML = (kept ? '' : 'This browser may clear the game’s storage, saves included, when the disk gets full ' +
+    'or after you haven’t visited for a while, so keep a backup. ') + 'The game keeps only what you save in <b>My Cricket → Load / Save</b>.';
+}
+
+async function backupToFolder(asked) {
+  try {
+    const r = await saves.backupToFolder({ request: asked, force: asked });
+    if (r.name) savesMsg(`Backed up to “${r.folder}” as ${r.name}.`);
+    else if (asked && r.skipped === 'permission') savesMsg('The browser did not allow writing to that folder.');
+    else if (asked && r.skipped === 'no-saves') savesMsg('No saves yet. Backups start once the game has saved something.');
+  } catch (e) { if (asked) savesMsg(`Backup failed: ${e.message}`); else console.warn('save backup:', e); }
+  showSaves();
+}
+
+async function chooseBackupFolder() {
+  try { await saves.chooseFolder(); }
+  catch (e) { if (e.name !== 'AbortError') savesMsg(`Couldn't use that folder: ${e.message}`); return; }
+  await backupToFolder(true);
+}
+
+function setupSaves() {
+  $('saves-export').onclick = async () => {
+    try {
+      const blob = await saves.exportZip();
+      const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: saves.zipName() });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      saves.noteDownload();
+      savesMsg('Backup downloaded. Keep it somewhere safe: Restore puts it back, in this or another browser.');
+    } catch (e) { savesMsg(`Couldn't make the backup: ${e.message}`); }
+    showSaves();
+  };
+  $('saves-import').onchange = async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    const s = await saves.summary();
+    if (s.files && !confirm(`Replace your ${s.files} saved files with the backup “${file.name}”? You can undo this afterwards.`)) return;
+    try { savesMsg(`Restored ${await saves.restoreZip(file)} files from ${file.name}.`, true); }
+    catch (err) { savesMsg(err.message); }
+    showSaves();
+  };
 }
 
 // ------------------------------------------------------------------ online lobby

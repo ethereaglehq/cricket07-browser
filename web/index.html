@@ -88,6 +88,17 @@
   details select { flex: 1; padding: 7px 10px; }
   .msg { min-height: 1.5em; color: #f2b8a8; font-size: 14px; }
 
+  /* home: the saves card (backup, restore, automatic copies to a folder) */
+  .saves { margin-top: 18px; padding: 12px 14px; display: grid; gap: 6px; }
+  .saves-row { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; }
+  .saves-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn.slim { padding: 6px 12px; font-size: 13px; border-radius: 10px; cursor: pointer; }
+  .linkish { padding: 0; border: 0; background: none; color: var(--accent-hi); font: inherit; text-decoration: underline;
+    text-underline-offset: 2px; cursor: pointer; }
+  .linkish:hover { color: var(--fg); }
+  .saves p { margin: 0; }
+  .saves .warn { color: #f2c48d; }
+
   /* lobby */
   .code { font: 800 clamp(30px, 6vw, 42px)/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .18em; margin: 6px 0 2px; }
   .players { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
@@ -213,6 +224,18 @@
             <span>Online 1v1 with a friend, wherever they are.</span>
           </button>
         </div>
+        <div id="saves" class="card saves">
+          <div class="saves-row">
+            <div><b>Your saves</b> <span id="saves-status" class="small"></span></div>
+            <div class="saves-actions">
+              <button id="saves-export" class="btn ghost slim">Download backup</button>
+              <label class="btn ghost slim">Restore…<input id="saves-import" type="file" accept=".zip,application/zip" hidden></label>
+            </div>
+          </div>
+          <p id="saves-folder-row" class="small hidden"></p>
+          <p id="saves-note" class="small">The game keeps only what you save in <b>My Cricket → Load / Save</b>.</p>
+          <p id="saves-msg" class="small hidden"></p>
+        </div>
         <p class="small" style="margin-top:22px">Use a controller, or the keyboard: arrows to move, S to select.<br>
           Fullscreen: <kbd>Alt</kbd> + <kbd>Enter</kbd> (<kbd>⌥</kbd> + <kbd>Enter</kbd> on Mac) or the button in the corner.</p>
         <p class="small"><a href="#" id="reset">Use a different game folder</a></p>
@@ -325,6 +348,8 @@
   </button>
 </main>
 <script src="netplay.js"></script>
+<script src="zip.js"></script>
+<script src="saves.js"></script>
 <script src="loader.js"></script>
 </body>
 </html>

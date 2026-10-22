@@ -864,7 +864,13 @@ W(GetFileSize) {
     if (ARG(1)) W32(ARG(1), (uint32_t)((uint64_t)st.st_size >> 32));
     RET(2, (uint32_t)st.st_size);
 }
-W(FlushFileBuffers) { RET(1, 1); }
+W(FlushFileBuffers) {
+    /* the game asks for its writes (saves) to reach storage: in the browser that is OPFS, where a write is
+       only certain to persist once flushed */
+    WinHandle *x = handle_get(ARG(0), H_FILE);
+    if (x && x->fd >= 0 && fsync(x->fd)) LOG("[file] FlushFileBuffers(%s): %s\n", x->path, strerror(errno));
+    RET(1, 1);
+}
 W(SetEndOfFile) {
     WinHandle *x = handle_get(ARG(0), H_FILE);
     if (!x) RET(1, 0);
