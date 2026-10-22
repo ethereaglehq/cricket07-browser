@@ -189,8 +189,12 @@ LockPersonality=yes
 UMask=0077"
 if [ -n "${CRICKET07_NO_SYSTEMD:-}" ]; then
   say "Starting (no systemd)"
-  pkill -f "wrangler.js dev --ip 127.0.0.1 --port 8787" 2>/dev/null || true
-  pkill -f "caddy run --config $ETC/Caddyfile" 2>/dev/null || true
+  # the old ones first (systemd stops a service's every process; here the room server's runtime, workerd, can
+  # outlive wrangler and keep its port)
+  stop() { pkill -f "$1" || true; for _ in $(seq 40); do pgrep -f "$1" >/dev/null || return 0; sleep 0.25; done; pkill -9 -f "$1" || true; }
+  stop "wrangler.js dev --ip 127.0.0.1 --port 8787"
+  stop "$DIR/tools/node_modules/@cloudflare/workerd"
+  stop "caddy run --config $ETC/Caddyfile"
   # with the services' environment and nothing of this shell's; Caddy as root here (binding 443 needs the
   # capability systemd gives it)
   RUNUSER=$(command -v runuser)
