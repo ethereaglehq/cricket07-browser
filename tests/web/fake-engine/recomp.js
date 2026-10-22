@@ -8,7 +8,12 @@
 // input for it is known. Its "game state" is a hash of every input applied, so a desync shows.
 //
 // Test hooks on the module: _test_save(rel, text) writes a save file, _test_files() lists the game folder,
-// _test_hang() stops presenting frames (a frozen game), _test_info() returns state for assertions.
+// _test_hang() stops presenting frames (a frozen game) and _test_unhang() resumes, _test_info() returns state for
+// assertions. Failures as the real build reports them: _test_print(text) prints on the engine's stderr,
+// _test_abort(what) is an abort on an engine thread (Emscripten prints "Aborted(...)" and calls onAbort),
+// _test_worker_error(message, print) is a trap in a worker (Emscripten prints "worker sent an error!" unless
+// print is false, then the error reaches the page), _test_throw_pump(n) makes the next n frame pumps throw.
+// With RC_LOG_FPS (?fps) it prints [fps] and [mem] lines like host/d3d8.c.
 'use strict';
 
 async function createRecomp(opts) {
@@ -121,8 +126,15 @@ async function createRecomp(opts) {
     } else for (const p of pads) mix(p.buttons);
     frame = next;
     present();
+    if (ENV.RC_LOG_FPS && frame % 60 === 0) {   // what host/d3d8.c prints every 2 s with RC_LOG_FPS
+      errLine(`[fps] 60.0  (frame ${frame}, 120 draws in the last frame)`);
+      errLine(`[mem] guest heap ${100 + (frame >> 6)} MB (3 MB in free blocks), virtual allocations 580 MB (560 MB live), ` +
+        `GPU textures 210 MB, bind groups made 1234; frame ${frame}, COM objects 2100, sound buffers 40, threads 6 of 9 ` +
+        'running, code regions 12, import slots 712, heaps created 1 destroyed 0');
+    }
     return 1;
   }
+  const errLine = (t) => (opts.printErr || console.log)(t);
 
   let ctx = null;
   function draw() {
@@ -140,7 +152,7 @@ async function createRecomp(opts) {
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
   new Uint32Array(memory.buffer).set([0, 0, 44100, 1024]);   // an empty audio ring (host/dsound.c layout)
 
-  let saveCount = 0;
+  let saveCount = 0, pumps = 0, throwPumps = 0, keys = 0;
   const M = {
     wasmMemory: memory,
     _rc_audio_ring: () => 0,
@@ -151,12 +163,15 @@ async function createRecomp(opts) {
     },
     _rc_set_canvas_size(w, h) { if (ctx) { ctx.canvas.width = w; ctx.canvas.height = h; } },
     _rc_gpu_pump(present) {
+      pumps++;
       if (!present) return 0;
+      if (throwPumps > 0) { throwPumps--; throw new Error('stand-in: the frame pump failed'); }
       const ok = step();
       if (ok) draw();
       return ok;
     },
     _input_key_hid(usage, down) {
+      keys++;
       // S in solo play: the game writes a save (its Load / Save screen)
       if (usage === 22 && down && !net) M._test_save(`Saves/save-${++saveCount}.sav`, `save ${saveCount} at frame ${frame}\n`);
     },
@@ -185,14 +200,24 @@ async function createRecomp(opts) {
       check(s, f);
     },
     _netplay_player_left(s) { if (net && s >= 0 && s < 4) net.left[s] = true; },
-    _netplay_status: (what) => (!net ? 0 : what === 0 ? frame : what === 1 ? Math.round(net.waitMs) : what === 2 ? net.desync : net.stalls),
+    _netplay_status: (what) => (!net ? 0 : what === 0 ? frame : what === 1 ? Math.round(net.waitMs) : what === 2 ? net.desync
+      : what === 4 ? (net.waitingSince ? 1 : 0) : net.stalls),
     _netplay_set_delay(d) { if (net && d >= 1 && d <= 60) net.delay = d; },
 
     async _test_save(rel, text) { await writeFile(user, [...DOCS, rel].join('/'), text); },
     _test_files: () => gameFiles,
     _test_saves_at_start: () => savesAtStart,
-    _test_hang() { hung = true; },
-    _test_info: () => ({ frame, hash: [hashLo, hashHi], net: net && { slot: net.slot, delay: net.delay, stalls: net.stalls, desync: net.desync, lastSent: net.lastSent } }),
+    _test_hang() { hung = true; if (net) net.waitingSince = 0; },   // stuck, not waiting for other players
+    _test_unhang() { hung = false; },
+    _test_print(text) { for (const line of String(text).split('\n')) errLine(line); },
+    _test_abort(what) { hung = true; errLine(`Aborted(${what})`); opts.onAbort?.(what); },
+    _test_worker_error(message, print = true) {
+      hung = true;
+      if (print) errLine(`worker sent an error! ${location.origin}/build/recomp.js:1: Uncaught RuntimeError: ${message}`);
+      setTimeout(() => { throw new WebAssembly.RuntimeError(message); });
+    },
+    _test_throw_pump(n = 1) { throwPumps = n; },
+    _test_info: () => ({ frame, pumps, keys, hash: [hashLo, hashHi], net: net && { slot: net.slot, delay: net.delay, stalls: net.stalls, desync: net.desync, lastSent: net.lastSent } }),
   };
   return M;
 }

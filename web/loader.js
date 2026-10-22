@@ -9,6 +9,7 @@
 //              on a machine that simulates a frame well within 16 ms, else it hitches)
 //              ?netplay=<url> (the room server for online play, see server/; default: this page's origin)
 //              ?join=<room code>
+//              ?watchdog=N (seconds without a new frame before the page offers a restart, default 15; 0: never)
 //
 // Online play (netplay.js, host/netplay.c): players meet in a room on the server; when the host starts,
 // every page boots the game in deterministic lockstep mode with fresh saves, and only pad inputs travel.
@@ -111,26 +112,30 @@ const NET_KEYS = {   // KeyboardEvent.code -> standard-gamepad bit (20: Esc key)
 let netKeyBits = 0;
 let netKeyPressed = 0;   // keys pressed since the last poll, so a tap shorter than a frame still counts
 
+// Nothing reaches a game that has stopped. While the overlay saying so is up, presses go to its buttons
+// instead; releases still reach the game, so no key stays held.
+const pressOff = (down) => engineDead || (down && haltMode);
+
 function hookInput(M, net) {
   const canvas = $('canvas');
   if (net) {
     const key = (down) => (e) => {
       const bit = NET_KEYS[e.code];
-      if (bit === undefined) return;
-      e.preventDefault();
+      if (bit === undefined || pressOff(down)) return;
+      if (!haltMode) e.preventDefault();
       if (down) { netKeyBits |= 1 << bit; netKeyPressed |= 1 << bit; } else netKeyBits &= ~(1 << bit);
       pollLocalPad(M);   // straight to the game: waiting for the next animation frame would add up to 16 ms
     };
     window.addEventListener('keydown', key(true));
     window.addEventListener('keyup', key(false));
-    window.addEventListener('blur', () => { netKeyBits = 0; pollLocalPad(M); });
+    window.addEventListener('blur', () => { netKeyBits = 0; if (!engineDead) pollLocalPad(M); });
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     return;
   }
   const key = (down) => (e) => {
     const u = HID[e.code];
-    if (u === undefined || e.repeat) return;
-    if (!(e.metaKey && !down)) e.preventDefault();
+    if (u === undefined || e.repeat || pressOff(down)) return;
+    if (!haltMode && !(e.metaKey && !down)) e.preventDefault();
     M._input_key_hid(u, down ? 1 : 0);
   };
   window.addEventListener('keydown', key(true));
@@ -138,14 +143,15 @@ function hookInput(M, net) {
   // The game draws its own cursor and reads relative motion. Lock the pointer when the browser allows
   // it (then the system cursor can't leave the game); without a lock, motion over the canvas still works.
   canvas.addEventListener('mousedown', (e) => {
+    if (pressOff(true)) return;
     if (document.pointerLockElement !== canvas) {
       const p = canvas.requestPointerLock?.();
       if (p && p.catch) p.catch(() => {});
     }
     M._input_mouse_button([0, 2, 1][e.button] ?? 0, 1);
   });
-  window.addEventListener('mouseup', (e) => M._input_mouse_button([0, 2, 1][e.button] ?? 0, 0));
-  canvas.addEventListener('mousemove', (e) => M._input_mouse_move(e.movementX, e.movementY));
+  window.addEventListener('mouseup', (e) => { if (!engineDead) M._input_mouse_button([0, 2, 1][e.button] ?? 0, 0); });
+  canvas.addEventListener('mousemove', (e) => { if (!pressOff(true)) M._input_mouse_move(e.movementX, e.movementY); });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
@@ -225,15 +231,16 @@ function pollGamepads(M) {
 // ------------------------------------------------------------------ audio
 
 async function startAudio(M) {
-  if (params.has('mute')) return;
+  if (params.has('mute')) return null;
   const ctx = new AudioContext({ sampleRate: 44100, latencyHint: 'interactive' });
   await ctx.audioWorklet.addModule('audio-worklet.js');
   const node = new AudioWorkletNode(ctx, 'rc-ring', { outputChannelCount: [2] });
   node.port.postMessage({ memory: M.wasmMemory, ring: M._rc_audio_ring() });
   node.connect(ctx.destination);
-  const resume = () => ctx.resume();
+  const resume = () => { if (!engineDead) ctx.resume(); };
   window.addEventListener('pointerdown', resume);
   window.addEventListener('keydown', resume);
+  return ctx;
 }
 
 // ------------------------------------------------------------------ run
@@ -258,6 +265,7 @@ function showNetStatus(M, session) {
   el.classList.remove('hidden');
   let lastFrame = 0, lastT = performance.now();
   setInterval(() => {
+    if (engineDead) { el.classList.add('hidden'); return; }
     const frame = M._netplay_status(0), desync = M._netplay_status(2), stalls = M._netplay_status(3);
     const now = performance.now();
     // the game thread always idles until the next frame's inputs arrive; it's only "waiting" when that
@@ -298,8 +306,10 @@ async function run(session) {
   await new Promise((ok, fail) => { script.onload = ok; script.onerror = fail; document.head.appendChild(script); });
   const M = await createRecomp({
     arguments: ['/opfs/' + OPFS_DIR],
-    print: (t) => console.log(t),
-    printErr: (t) => console.log(t),
+    print: engineLine,
+    printErr: engineLine,
+    // Emscripten calls this for an abort on any of the engine's threads (a worker's is forwarded here)
+    onAbort: (what) => engineStopped('crash', 'The game crashed.', `Aborted(${what ?? ''})`),
     preRun: [(m) => {
       if (params.has('mute')) m.ENV.RC_NO_AUDIO = '1';
       if (params.get('exe')) m.ENV.RC_EXE = params.get('exe');
@@ -311,31 +321,42 @@ async function run(session) {
       if (!params.has('fps')) delete m.ENV.RC_LOG_FPS;
     }],
   });
+  engine = { M, session, audio: null };
   const canvas = $('canvas');
   M._rc_gpu_init(canvas.width, canvas.height);
-  new ResizeObserver(() => { sizeCanvas(); M._rc_set_canvas_size(canvas.width, canvas.height); }).observe(canvas);
+  new ResizeObserver(() => { sizeCanvas(); if (!engineDead) M._rc_set_canvas_size(canvas.width, canvas.height); }).observe(canvas);
   hookInput(M, !!session);
   if (session) { session.client.attach(M); showNetStatus(M, session); }
-  startAudio(M).catch((e) => console.warn('audio unavailable:', e));
+  startAudio(M).then((ctx) => { engine.audio = ctx; if (engineDead) ctx?.close(); }).catch((e) => console.warn('audio unavailable:', e));
   const poll = session ? pollLocalPad : pollGamepads;
+  // Every call into the engine from here on goes through live(): none once it has stopped, and one that
+  // throws is reported (once) without ending the loop it runs in.
+  const live = (where, fn) => { if (engineDead) return; try { fn(); } catch (e) { pageError(where, e); } };
+  const pump = (present) => { const n = M._rc_gpu_pump(present); if (n) framesPresented(n); return n; };
   // Online, present at most 60 times a second: every Present is a lockstep frame, and the input delay and
   // the time a frame has to simulate are counted in those (netplay.js: autoDelay), so following a 120 Hz
   // display would halve both. Solo play follows the display. A frame is due every 1/60 s, with a little
   // tolerance so a 60 Hz display's own jitter doesn't skip one.
   let due = 0;
   const frame = (t) => {
-    poll(M);
-    if (!session || t >= due - 4) {
-      if (M._rc_gpu_pump(1)) { due = Math.max(due + 1000 / 60, t - 4); }
-    } else M._rc_gpu_pump(0);   // mid-frame readbacks only
+    if (engineDead) return;
+    // the next frame first: an exception below used to end the picture for good, while the game and its
+    // sound played on
     requestAnimationFrame(frame);
+    live('frame loop', () => {
+      poll(M);
+      if (!session || t >= due - 4) {
+        if (pump(1)) { due = Math.max(due + 1000 / 60, t - 4); }
+      } else pump(0);   // mid-frame readbacks only
+    });
   };
   requestAnimationFrame(frame);
   // readbacks mid-frame are answered without waiting for vsync; online, the pad is also sampled here
-  setInterval(() => { if (session) poll(M); M._rc_gpu_pump(0); }, 1);
+  setInterval(() => live('readback pump', () => { if (session) poll(M); pump(0); }), 1);
   // Online, a hidden tab still has to present frames (browsers pause requestAnimationFrame there), or the
   // lockstep would freeze every other player with it.
-  if (session) setInterval(() => { if (document.hidden) { poll(M); M._rc_gpu_pump(1); } }, 16);
+  if (session) setInterval(() => { if (document.hidden) live('hidden-tab frames', () => { poll(M); pump(1); }); }, 16);
+  watchdog(M, session);
   canvas.focus();
   window.recomp = M;
 }
@@ -356,6 +377,7 @@ async function boot() {
       'Remote Desktop and virtual machines often have no GPU for the browser.');
     return;
   }
+  gpuInfo = describeAdapter(adapter);
   if (adapter.isFallbackAdapter || adapter.info?.isFallbackAdapter)
     console.warn('WebGPU: only a software (fallback) adapter is available; the game will be slow');
   if (!navigator.storage?.getDirectory) { status('This browser has no Origin Private File System.'); return; }
@@ -394,6 +416,181 @@ async function boot() {
     return;
   }
   ready();
+}
+
+// ------------------------------------------------------------------ when the game stops
+
+// When one of the engine's threads aborted or trapped, the page went on showing the last frame (often with the
+// sound still playing) and logged a line. Now it notices: Emscripten's onAbort, an engine error reaching the page,
+// or a line the engine prints just before it gives up. Then it stops calling into the engine (a call waiting on a
+// lock the dead thread held would hang the tab) and says what happened, with Restart. A watchdog does the same
+// for a game that stops presenting frames without a word. Either way the player can copy a diagnostics report.
+const WATCHDOG_MS = (params.has('watchdog') ? Number(params.get('watchdog')) || 0 : 15) * 1000;
+// What the engine prints when it can't go on (each is followed by an abort or a trap), as a player reads it.
+const FATAL_LINES = [
+  [/guest heap exhausted/, 'The game ran out of memory.'],
+  [/too many live COM objects|^out of handles/, 'The game ran out of resources.'],
+  [/\*\*\* guest trap|guest write of .* outside guest memory/, 'The game hit an error it can’t recover from.'],
+  [/^\[wgpu\] device lost/, 'The browser lost the graphics device: the graphics driver restarted, or the GPU ran out of memory.'],
+  [/^\[sched\] deadlock/, 'The game got stuck.'],
+  [/sent an error!|^Aborted\(/, 'The game crashed.'],
+  [/^\[kernel32\] FatalAppExit/, 'The game stopped with an error.'],
+  [/^\[kernel32\] (ExitProcess|TerminateProcess)|^game returned/, 'The game has closed.', 'exit'],
+];
+
+let engine = null;       // { M, session, audio } once the game runs
+let engineDead = null;   // { why, detail } once it has stopped: nothing calls into it any more
+let haltMode = null;     // the overlay: null (hidden), 'stall', 'crash' or 'exit'
+const health = { started: performance.now(), frames: 0, lastFrameAt: performance.now(), netFrame: 0 };
+let gpuInfo = 'not checked';
+
+// The engine's console output, kept for the diagnostics: the last lines, its memory reports ([mem], with ?fps or
+// ?log) and whatever looks like trouble.
+const recent = [], memLines = [], errorLines = [];
+const keep = (list, line, n) => { list.push(line); if (list.length > n) list.shift(); };
+const noteError = (line) => keep(errorLines, `${(performance.now() / 1000).toFixed(1)} s: ${line}`, 40);
+
+function engineLine(text) {
+  const line = String(text);
+  console.log(line);
+  keep(recent, line, 200);
+  if (line.startsWith('[mem]')) keep(memLines, line, 6);
+  else if (/error|fail|exhausted|trap|abort|lost|full|too many|not supported|out of |can't/i.test(line)) noteError(line);
+  for (const [re, why, mode] of FATAL_LINES) if (re.test(line)) { engineStopped(mode || 'crash', why, line.trim()); break; }
+}
+
+function engineStopped(mode, why, detail) {
+  if (engineDead) return;
+  engineDead = { why, detail };
+  console.error(`[page] the game has stopped: ${detail || why}`);
+  noteError(`the game stopped: ${detail || why}`);
+  if (engine) {
+    engine.audio?.close().catch(() => {});
+    // online, leave the room: the others' games carry on with this player's pad at rest
+    if (engine.session) { engine.M.rcNetplayPump = null; engine.session.client.close(); }
+  }
+  halt(mode, why, detail);
+}
+
+// An exception in a loop that calls the engine: reported once per loop, counted after that.
+const pageErrors = new Map();
+function pageError(where, e) {
+  const seen = pageErrors.get(where);
+  if (seen) { seen.count++; return; }
+  pageErrors.set(where, { count: 1, message: String(e?.stack || e) });
+  console.error(`[page] ${where} failed (reported once; it goes on): ${e?.stack || e}`);
+  noteError(`${where}: ${e?.message || e}`);
+}
+
+function framesPresented(n) {
+  health.frames += n;
+  health.lastFrameAt = performance.now();
+  if (haltMode === 'stall') unhalt();   // it recovered by itself
+}
+
+// Errors that reach the page: the engine's own (a trap or an abort in WebAssembly, a worker's error) stop the
+// game; others are only noted for the diagnostics.
+function pageLevelError(err, message) {
+  const msg = String(message || err?.message || err);
+  noteError(`page: ${msg}`);
+  const fromEngine = (typeof WebAssembly !== 'undefined' && err instanceof WebAssembly.RuntimeError) ||
+    (typeof ErrorEvent !== 'undefined' && err instanceof ErrorEvent) || /RuntimeError|Aborted\(|sent an error/.test(msg);
+  if (engine && fromEngine) engineStopped('crash', 'The game crashed.', msg);
+}
+window.addEventListener('error', (e) => pageLevelError(e.error, e.message));
+window.addEventListener('unhandledrejection', (e) => pageLevelError(e.reason));
+
+function halt(mode, why, detail) {
+  if (haltMode && haltMode !== 'stall') return;   // the first stop is the one to explain
+  haltMode = mode;
+  $('halt-title').textContent = { stall: 'The game isn’t responding', exit: 'The game has closed' }[mode] || 'The game stopped';
+  $('halt-why').textContent = why;
+  $('halt-detail').textContent = detail || '';
+  $('halt-wait').classList.toggle('hidden', mode !== 'stall');
+  $('halt').classList.remove('hidden');
+  if ($('halt-more').open) $('halt-report').value = diagnostics();
+  document.exitPointerLock?.();
+  (mode === 'stall' ? $('halt-wait') : $('halt-copy')).focus();   // not Restart: a key meant for the game could press it
+}
+function unhalt() {
+  haltMode = null;
+  $('halt').classList.add('hidden');
+  $('canvas').focus();
+}
+
+// The watchdog: no frame for WATCHDOG_MS in a visible tab is a stuck game (the first frame may take a minute:
+// the game loads). A hidden tab presents nothing (browsers pause animation frames there), and online the game
+// also waits, frozen, for the other players' input: neither counts.
+function watchdog(M, session) {
+  health.started = health.lastFrameAt = performance.now();
+  document.addEventListener('visibilitychange', () => { health.lastFrameAt = performance.now(); });
+  if (!WATCHDOG_MS) return;
+  setInterval(() => {
+    if (engineDead) return;
+    const now = performance.now();
+    let waiting = document.visibilityState !== 'visible';
+    if (session && !waiting) {
+      try { health.netFrame = M._netplay_status(0); waiting = M._netplay_status(4) || session.reconnecting; }
+      catch (e) { pageError('watchdog', e); }
+    }
+    if (waiting) { health.lastFrameAt = now; return; }
+    const quiet = now - health.lastFrameAt, s = Math.round(quiet / 1000);
+    if (haltMode || quiet < (health.frames ? WATCHDOG_MS : Math.max(WATCHDOG_MS, 60000))) return;
+    halt('stall', health.frames ? `No new picture for ${s} seconds. It may still recover by itself.`
+      : `The game hasn’t shown a picture in ${s} seconds.`);
+  }, 1000);
+}
+
+function describeAdapter(a) {
+  const i = a.info || {};
+  const name = [i.vendor, i.architecture, i.device, i.description].filter(Boolean).join(' / ') || 'no details';
+  return name + (a.isFallbackAdapter || i.isFallbackAdapter ? ' (software fallback)' : '') +
+    (a.features ? `, BC textures ${a.features.has('texture-compression-bc') ? 'yes' : 'no'}` : '') +
+    (a.limits ? `, max texture ${a.limits.maxTextureDimension2D}, max buffer ${mb(a.limits.maxBufferSize)} MB` : '');
+}
+
+// A report for bug reports: the browser and GPU, the game's state, and its last console lines.
+function diagnostics() {
+  const now = performance.now(), sec = (ms) => `${(ms / 1000).toFixed(1)} s`;
+  const ua = navigator.userAgentData, s = engine?.session, canvas = $('canvas');
+  const memory = engine?.M.wasmMemory?.buffer.byteLength;
+  return [
+    'Cricket 07 diagnostics', `when: ${new Date().toISOString()}`, `page: ${location.origin}${location.pathname}`,
+    `URL options: ${location.search || '(none)'}`,
+    `browser: ${navigator.userAgent}`,
+    ...(ua ? [`platform: ${ua.platform || '?'}${ua.mobile ? ' (mobile)' : ''}; ${ua.brands.map((b) => `${b.brand} ${b.version}`).join(', ')}`] : []),
+    `display: ${screen.width}x${screen.height} at ${devicePixelRatio}x, canvas ${canvas.width}x${canvas.height}, ` +
+      `${document.fullscreenElement ? 'fullscreen' : 'in the page'}, tab ${document.visibilityState}`,
+    `computer: ${navigator.hardwareConcurrency || '?'} threads, ${navigator.deviceMemory || '?'} GB memory, ` +
+      `cross-origin isolated ${crossOriginIsolated}`,
+    `WebGPU adapter: ${gpuInfo}`,
+    `wasm memory: ${memory ? `${mb(memory)} MB` : 'none yet'}`,
+    `game: ${engineDead ? `stopped: ${engineDead.detail || engineDead.why}` : engine ? 'running' : 'not started'}` +
+      `${haltMode === 'stall' ? ' (not responding)' : ''}, ${s ? `online, player ${s.you + 1} of ${s.players}, delay ${s.delay}, ` +
+      `lockstep frame ${health.netFrame}` : 'solo'}`,
+    `frames presented: ${health.frames}, the last ${health.frames ? `${sec(now - health.lastFrameAt)} ago` : 'never'}, ` +
+      `in ${sec(now - health.started)} of play`,
+    ...[...pageErrors].map(([where, e]) => `${where}: ${e.count} exception${e.count > 1 ? 's' : ''}, the first: ${e.message.split('\n')[0]}`),
+    '', 'memory reports (every 2 s with ?fps, every 10 s with ?log):',
+    ...(memLines.length ? memLines : ['(none: open the game with ?log or ?fps for them)']),
+    '', 'errors and warnings:', ...(errorLines.length ? errorLines : ['(none)']),
+    '', `the game's last ${recent.length} lines:`, ...recent,
+  ].join('\n');
+}
+
+async function copyDiagnostics() {
+  const b = $('halt-copy'), text = diagnostics();
+  $('halt-report').value = text;
+  try { await navigator.clipboard.writeText(text); b.textContent = 'Copied'; }
+  catch { $('halt-more').open = true; $('halt-report').select(); b.textContent = 'Copy the text below'; }
+  setTimeout(() => { b.textContent = 'Copy diagnostics'; }, 3000);
+}
+
+function setupHalt() {
+  $('halt-restart').onclick = () => location.reload();
+  $('halt-wait').onclick = () => { health.lastFrameAt = performance.now(); unhalt(); };
+  $('halt-copy').onclick = copyDiagnostics;
+  $('halt-more').ontoggle = () => { if ($('halt-more').open) $('halt-report').value = diagnostics(); };
 }
 
 // ------------------------------------------------------------------ fullscreen
@@ -807,4 +1004,5 @@ function setupKbdHelp() {
 
 setupFullscreen();
 setupKbdHelp();
+setupHalt();
 boot();

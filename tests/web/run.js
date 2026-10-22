@@ -40,8 +40,9 @@ function makeGameFolder(extra = {}) {
   return g;
 }
 
-async function player(browser, url, name = 'player') {
-  const ctx = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 860 }, ignoreHTTPSErrors: !!process.env.BASE_URL });
+async function player(browser, url, name = 'player', contextOptions = {}) {
+  const ctx = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 860 },
+    ignoreHTTPSErrors: !!process.env.BASE_URL, ...contextOptions });
   await ctx.addInitScript(STUB_GPU);
   const page = await ctx.newPage();
   page.logs = [];
@@ -543,8 +544,9 @@ test('patches: a patch may not overwrite the page\'s own marker file', async ({ 
   assert.match(plan, /\.installed\.json \(a name this page uses itself\)/);
 });
 
-test('online: two players stay in lockstep', async ({ browser, base, netplay }) => {
-  const q = `?netplay=${encodeURIComponent(netplay)}`;
+// A host and a guest in a room, the match started. options: more URL options for both, e.g. 'watchdog=2&'.
+async function startOnline(browser, base, netplay, options = '') {
+  const q = `?${options}netplay=${encodeURIComponent(netplay)}`;
   const host = await player(browser, base + q, 'host');
   await install(host);
   await host.click('#go-online');
@@ -552,7 +554,7 @@ test('online: two players stay in lockstep', async ({ browser, base, netplay }) 
   await host.click('#np-host');
   await host.waitForSelector('#view-lobby:not(.hidden)');
   const code = (await host.textContent('#np-room')).trim();
-  const guest = await player(browser, `${base}?join=${code}&netplay=${encodeURIComponent(netplay)}`, 'guest');
+  const guest = await player(browser, `${base}?${options}join=${code}&netplay=${encodeURIComponent(netplay)}`, 'guest');
   await install(guest);
   await guest.fill('#np-name', 'Guest');
   await guest.click('#np-join');
@@ -560,11 +562,147 @@ test('online: two players stay in lockstep', async ({ browser, base, netplay }) 
   await host.waitForFunction(() => !document.getElementById('np-start').disabled);
   await sleep(1500);   // a few pings, for the auto delay
   await host.click('#np-start');
+  return { host, guest };
+}
+
+test('online: two players stay in lockstep', async ({ browser, base, netplay }) => {
+  const { host, guest } = await startOnline(browser, base, netplay);
   await Promise.all([waitFrames(host, 300, 30000), waitFrames(guest, 300, 30000)]);
   const [a, b] = await Promise.all([host, guest].map((p) => p.evaluate(() => window.recomp._test_info())));
   assert.strictEqual(a.net.desync, 0, 'host saw a desync');
   assert.strictEqual(b.net.desync, 0, 'guest saw a desync');
   assert.match(await host.textContent('#netstatus'), /Online · player 1 of 2/);
+}, { online: true });
+
+// ---- when the game stops (web/loader.js)
+
+const haltShown = (page) => page.isVisible('#halt');
+const engineInfo = (page) => page.evaluate(() => window.recomp._test_info());
+async function playSolo(page) {
+  await page.click('#play');
+  await waitFrames(page, 10);
+}
+
+test('stops: an exception in a frame does not end the picture', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  await playSolo(page);
+  await page.evaluate(() => window.recomp._test_throw_pump(5));
+  await waitFrames(page, await frameOf(page) + 60);
+  const reports = page.logs.filter((l) => /frame loop failed/.test(l));
+  assert.strictEqual(reports.length, 1, `reported once: ${reports.join(' | ')}`);
+  assert.match(reports[0], /stand-in: the frame pump failed/);
+  assert.ok(!await haltShown(page), 'an overlay for a frame that recovered');
+});
+
+test('stops: running out of memory says so, the engine is left alone, Restart keeps the saves', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  await playSolo(page);
+  await page.keyboard.press('s');   // the stand-in saves on S
+  await sleep(200);
+  await page.evaluate(() => {
+    window.recomp._test_print('guest heap exhausted (1048576 bytes requested; 255 MB used, 2 MB of it in free blocks)');
+    window.recomp._test_abort('native code called abort()');
+  });
+  await page.waitForSelector('#halt:not(.hidden)');
+  assert.match(await page.textContent('#halt-title'), /The game stopped/);
+  assert.match(await page.textContent('#halt-why'), /ran out of memory/);
+  assert.match(await page.textContent('#halt-detail'), /^guest heap exhausted \(1048576 bytes requested/);
+  assert.match(await page.textContent('#halt'), /Your saves are safe/);
+  // nothing calls into the stopped engine: no frame pumps, no keys
+  const before = await engineInfo(page);
+  await page.keyboard.press('ArrowUp');
+  await page.mouse.click(300, 300);
+  await sleep(300);
+  const after = await engineInfo(page);
+  assert.strictEqual(after.pumps, before.pumps, 'the page still pumps the stopped engine');
+  assert.strictEqual(after.keys, before.keys, 'keys still reach the stopped engine');
+  await page.click('#halt-restart');
+  await page.waitForSelector('#view-home:not(.hidden)');
+  assert.ok(Object.keys(await savedFiles(page)).includes(DOCS + 'Saves/save-1.sav'), 'the save is gone');
+});
+
+test('stops: a trap, a worker error, a lost GPU and an exit each say what happened', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  const cases = [
+    [(M) => { M._test_print('\n*** guest trap at 00412345: indirect call to unknown function (return address 00401234)\n' +
+      '    eax=00000000 ecx=1234abcd'); M._test_abort('native code called abort()'); },
+     /The game stopped/, /can’t recover/, /^\*\*\* guest trap at 00412345/],
+    [(M) => M._test_worker_error('memory access out of bounds'), /The game stopped/, /crashed/, /worker sent an error!.*out of bounds/],
+    [(M) => M._test_worker_error('unreachable', false), /The game stopped/, /crashed/, /RuntimeError: unreachable/],
+    [(M) => M._test_print('[wgpu] device lost (reason 1): the GPU process exited'), /The game stopped/, /graphics device/, /device lost/],
+    [(M) => M._test_print('[kernel32] ExitProcess(0) from thread 256, stack: 0040a000'), /has closed/, /has closed/, /ExitProcess/],
+  ];
+  for (const [fail, title, why, detail] of cases) {
+    await page.reload();
+    await page.waitForSelector('#view-home:not(.hidden)');
+    await playSolo(page);
+    await page.evaluate(`(${fail})(window.recomp)`);
+    await page.waitForSelector('#halt:not(.hidden)');
+    assert.match(await page.textContent('#halt-title'), title);
+    assert.match(await page.textContent('#halt-why'), why);
+    assert.match(await page.textContent('#halt-detail'), detail);
+    assert.ok(!await page.isVisible('#halt-wait'), 'Keep waiting offered for a stopped game');
+  }
+});
+
+test('stops: the watchdog offers Restart and diagnostics when frames stop, and goes when they resume', async ({ browser, base }) => {
+  const page = await player(browser, base + '?watchdog=2&fps', 'player', { permissions: ['clipboard-read', 'clipboard-write'] });
+  await install(page);
+  await playSolo(page);
+  await waitFrames(page, 130);   // two [mem] reports
+  await page.evaluate(() => window.recomp._test_hang());
+  await page.waitForSelector('#halt:not(.hidden)', { timeout: 6000 });
+  assert.match(await page.textContent('#halt-title'), /isn’t responding/);
+  assert.match(await page.textContent('#halt-why'), /No new picture for \d+ seconds/);
+  await page.click('#halt-copy');
+  await page.waitForFunction(() => document.getElementById('halt-report').value);
+  const report = await page.inputValue('#halt-report');
+  for (const want of [/^browser: .*Chrome/m, /^WebGPU adapter: /m, /^wasm memory: \d+ MB/m, /^frames presented: \d+, the last/m,
+    /^URL options: \?watchdog=2&fps$/m, /^game: running \(not responding\), solo/m, /^\[mem\] guest heap \d+ MB/m,
+    /^\[fake\] started/m])
+    assert.match(report, want);
+  if (/Copied/.test(await page.textContent('#halt-copy')))
+    assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), report);
+  // the game comes back by itself: the overlay goes
+  await page.evaluate(() => window.recomp._test_unhang());
+  await page.waitForSelector('#halt', { state: 'hidden' });
+  // Keep waiting: away until the watchdog sees no frames for as long again
+  await page.evaluate(() => window.recomp._test_hang());
+  await page.waitForSelector('#halt:not(.hidden)', { timeout: 6000 });
+  await page.click('#halt-wait');
+  assert.ok(!await haltShown(page), 'Keep waiting left the overlay up');
+  await page.waitForSelector('#halt:not(.hidden)', { timeout: 6000 });
+});
+
+test('stops: the watchdog leaves a hidden tab alone', async ({ browser, base }) => {
+  const page = await player(browser, base + '?watchdog=1');
+  await install(page);
+  await playSolo(page);
+  const setHidden = (hidden) => page.evaluate((hidden) => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (hidden ? 'hidden' : 'visible') });
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+  await setHidden(true);
+  await page.evaluate(() => window.recomp._test_hang());   // a hidden tab presents nothing
+  await sleep(3000);
+  assert.ok(!await haltShown(page), 'the watchdog fired in a hidden tab');
+  await setHidden(false);
+  await page.waitForSelector('#halt:not(.hidden)', { timeout: 5000 });
+});
+
+test('online: the watchdog waits for the other player, and flags a stuck game', async ({ browser, base, netplay }) => {
+  const { host, guest } = await startOnline(browser, base, netplay, 'watchdog=2&');
+  await Promise.all([waitFrames(host, 120, 30000), waitFrames(guest, 120, 30000)]);
+  await guest.evaluate(() => window.recomp._test_hang());   // the guest's game freezes; the host waits for its input
+  await guest.waitForSelector('#halt:not(.hidden)', { timeout: 8000 });
+  assert.match(await guest.textContent('#halt-title'), /isn’t responding/);
+  await sleep(3000);
+  assert.ok(await host.evaluate(() => window.recomp._netplay_status(4)), 'the host is not waiting for input');
+  assert.ok(!await haltShown(host), 'the host, waiting for the other player, got the overlay');
 }, { online: true });
 
 // ------------------------------------------------------------------ runner

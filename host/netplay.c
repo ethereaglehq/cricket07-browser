@@ -65,6 +65,7 @@ static uint32_t g_desync_frame;             /* first frame found to differ (0 = 
 static uint32_t g_frame;                    /* last frame processed */
 static uint32_t g_wait_ms;                  /* time spent waiting for remote input, for the page's status line */
 static uint32_t g_stalls;                   /* frames that waited over 10 ms for remote input (the delay didn't cover it) */
+static uint32_t g_waiting;                  /* the game thread is waiting for remote input now */
 static uint32_t g_frame_dt_us = 16667;      /* game time for the next frame (see top) */
 int netplay_on(void);
 uint32_t netplay_frame_dt_us(void) { return netplay_on() ? g_frame_dt_us : 0; }
@@ -198,6 +199,7 @@ void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void)) {
         uint32_t seq = __atomic_load_n(&g_in_seq, __ATOMIC_ACQUIRE);   /* before the check: a delivery in between wakes us */
         int all = 1;
         for (int s = 0; s < g_np_players; s++) if (!have_input(s, next)) { all = 0; break; }
+        __atomic_store_n(&g_waiting, !all, __ATOMIC_RELAXED);
         if (all) break;
 #ifdef __EMSCRIPTEN__
         emscripten_futex_wait(&g_in_seq, seq, 2.0);   /* woken by inputs_changed(); the timeout is a safety net */
@@ -285,7 +287,8 @@ EXPORT void netplay_player_left(int slot) {
     fprintf(stderr, "[netplay] player %d left; their pad is neutral from now on\n", slot);
 }
 
-/* For the page's status line: last frame, total ms spent waiting for others, first desync frame, stalls. */
+/* For the page's status line: last frame, total ms spent waiting for others, first desync frame, stalls, and
+   whether the game is waiting for other players' input right now (the page's watchdog leaves that alone). */
 EXPORT uint32_t netplay_status(int what) {
-    return what == 0 ? g_frame : what == 1 ? g_wait_ms : what == 2 ? g_desync_frame : g_stalls;
+    return what == 0 ? g_frame : what == 1 ? g_wait_ms : what == 2 ? g_desync_frame : what == 4 ? g_waiting : g_stalls;
 }

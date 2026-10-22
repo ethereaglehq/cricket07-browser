@@ -155,6 +155,20 @@
     color: #fff; font: 12px/1.5 ui-sans-serif, system-ui, sans-serif; pointer-events: none; backdrop-filter: blur(4px); }
   #netstatus.bad { background: rgba(170, 20, 20, .88); }
 
+  /* when the game stops (loader.js: "when the game stops"): what happened, Restart, diagnostics for a bug report */
+  #halt { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; padding: 20px; overflow: auto;
+    background: rgba(4, 9, 6, .84); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); cursor: auto; }
+  #halt .card { width: min(100%, 520px); background: rgba(14, 26, 18, .96); box-shadow: 0 20px 50px rgba(0, 0, 0, .5); }
+  #halt h2 { margin: 0 0 6px; font-size: 20px; }
+  #halt-detail { margin: 6px 0 10px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted);
+    overflow-wrap: anywhere; }
+  #halt-detail:empty { display: none; }
+  #halt .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+  #halt textarea { width: 100%; height: 150px; margin-top: 8px; padding: 8px; resize: vertical; color: var(--fg);
+    background: var(--field); border: 1px solid var(--line); border-radius: 10px;
+    font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #halt a { color: var(--accent-hi); }
+
   /* keyboard cheat sheet: shows beside the stage when the viewport has room, because in-game prompts
      use controller glyphs (triangle/circle/×/square, L1, R1) that keyboard players would otherwise have
      to guess at. Hidden in fullscreen, on narrow viewports and by choice (remembered in localStorage). */
@@ -205,6 +219,27 @@
         <path id="fs-icon" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
     </button>
     <div id="fstip" class="hidden">Press <kbd>Alt</kbd> + <kbd>Enter</kbd> for fullscreen</div>
+    <div id="halt" class="hidden" role="alertdialog" aria-modal="true" aria-labelledby="halt-title" aria-describedby="halt-why">
+      <div class="card">
+        <h2 id="halt-title">The game stopped</h2>
+        <p id="halt-why"></p>
+        <p id="halt-detail"></p>
+        <p class="small">Your saves are safe: everything the game has saved stays in this browser. Restarting only loses
+          progress since your last save.</p>
+        <div class="actions">
+          <button id="halt-restart" class="btn">Restart</button>
+          <button id="halt-wait" class="btn ghost hidden">Keep waiting</button>
+          <button id="halt-copy" class="btn ghost">Copy diagnostics</button>
+        </div>
+        <details id="halt-more">
+          <summary>Diagnostics</summary>
+          <textarea id="halt-report" readonly spellcheck="false" aria-label="Diagnostics"></textarea>
+          <p class="small" style="margin:6px 0 0">To report the problem, paste these into a
+            <a href="https://github.com/Dhaiwat10/cricket07-browser/issues" target="_blank" rel="noopener">new issue</a>
+            with what you were doing when it happened.</p>
+        </details>
+      </div>
+    </div>
     <div id="panel">
 
       <!-- loading: browser checks, the first-visit download, errors -->
