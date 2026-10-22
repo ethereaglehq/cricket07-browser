@@ -171,6 +171,7 @@
           : PROGRAM.test(it.path) ? 'a program' : ARCHIVE.test(it.path) ? 'an archive inside the patch: unpack it first'
             : it.size > MAX_FILE ? 'too large' : isProgram(await head(it)) ? 'a program' : null;
         if (why) { p.refused.push({ path: it.path, why }); continue; }
+        if (lower(it.path) === lower(marker)) { p.refused.push({ path: it.path, why: 'a name this page uses itself' }); continue; }
         const parts = it.path.split('/');
         const r = parts.findIndex((s) => ROSTER.test(s));
         if (r >= 0) {
@@ -218,19 +219,24 @@
       const est = await navigator.storage.estimate?.();
       if (est?.quota && est.quota - (est.usage || 0) < p.bytes * 2.1)
         throw new Error(`Not enough browser storage for this patch (it needs about ${Math.ceil(p.bytes * 2 / 1e6)} MB).`);
+      await recover();
       const installed = await list();
       const id = Date.now().toString(36);
       const keep = await (await storeDir()).getDirectoryHandle(id, { create: true });
       const roots = { game: await gameDir(), saves: await savesDir(true) };
-      const rec = { id, name: p.name, at: new Date().toISOString(), files: [], refused: p.refused.map((r) => r.path) };
+      // The record goes down first, listing every file and whether it replaces one, as "installing": an
+      // install cut short (a closed tab) is then undone on the next visit (recover) instead of leaving the
+      // game half-patched with nothing to remove it by.
+      const rec = { id, name: p.name, at: new Date().toISOString(), installing: true, files: [], refused: p.refused.map((r) => r.path) };
+      for (const it of all) rec.files.push({ where: it.where, path: it.dest, replaced: !!(await fileAt(roots[it.where], it.dest)) });
+      installed.push(rec);
+      await saveList(installed);
       const sums = [];
       try {
         for (let k = 0; k < all.length; k++) {
           const it = all[k];
           onProgress({ done: k, total: all.length, file: it.dest });
-          const was = await fileAt(roots[it.where], it.dest);
-          if (was) await writeAt(keep, `${it.where}/${it.dest}`, await was.getFile());   // the original, for uninstalling
-          rec.files.push({ where: it.where, path: it.dest, replaced: !!was });
+          if (rec.files[k].replaced) await writeAt(keep, `${it.where}/${it.dest}`, await (await fileAt(roots[it.where], it.dest)).getFile());   // the original
           let sum = 0;
           const counted = (await streamOf(it)).pipeThrough(new TransformStream({
             transform(chunk, ctl) { sum = RcZip.crc32(chunk, sum); ctl.enqueue(chunk); },
@@ -241,32 +247,50 @@
           if (it.where === 'game') sums.push(`${lower(it.dest)}:${it.size}:${sum}`);
         }
       } catch (err) {   // put back what was done so far
-        await restore(rec, keep, roots).catch((e) => console.warn('patch rollback:', e));
+        await restore(rec, keep, roots, undefined, true).catch((e) => console.warn('patch rollback:', e));
+        installed.pop();
+        await saveList(installed);
         await (await storeDir()).removeEntry(id, { recursive: true }).catch(() => {});
         throw err;
       }
       rec.content = sums.length ? await sha(sums.sort().join('\n')) : null;
-      installed.push(rec);
+      delete rec.installing;
       await saveList(installed);
       await updateVersion(installed);
       onProgress({ done: all.length, total: all.length });
       return rec;
     }
 
-    // undoes rec's files, newest first: originals back, added files removed
-    async function restore(rec, keep, roots, onProgress = () => {}) {
+    // Undoes rec's files, newest first: originals back, added files removed. partial: an install that
+    // stopped part way, where a file with no kept original was never overwritten.
+    async function restore(rec, keep, roots, onProgress = () => {}, partial = false) {
       const files = [...rec.files].reverse();
       for (let k = 0; k < files.length; k++) {
         const f = files[k];
         onProgress({ done: k, total: files.length, file: f.path });
         if (!f.replaced) { await removeAt(roots[f.where], f.path); continue; }
         const orig = await fileAt(keep, `${f.where}/${f.path}`);
+        if (!orig && partial) continue;
         if (!orig) throw new Error(`The original of ${f.path} is missing, so this patch can't be removed. Choose your game folder again to start clean.`);
         await writeAt(roots[f.where], f.path, await orig.getFile());
       }
     }
 
+    // An install that never finished (the tab closed part way) is undone. Returns its record, or null.
+    async function recover() {
+      const installed = await list();
+      const rec = installed[installed.length - 1];
+      if (!rec?.installing) return null;
+      const keep = await (await storeDir()).getDirectoryHandle(rec.id, { create: true });
+      await restore(rec, keep, { game: await gameDir(), saves: await savesDir(true) }, undefined, true);
+      installed.pop();
+      await saveList(installed);
+      await (await storeDir()).removeEntry(rec.id, { recursive: true }).catch(() => {});
+      return rec;
+    }
+
     async function uninstallLast(onProgress) {
+      await recover();
       const installed = await list();
       const rec = installed[installed.length - 1];
       if (!rec) return null;
@@ -284,7 +308,7 @@
     // a new game folder replaces the old one, patches and all
     async function forget() { await (await opfs()).removeEntry(store, { recursive: true }).catch(() => {}); }
 
-    return { plan, install, list, uninstallLast, forget, rosterHome };
+    return { plan, install, list, uninstallLast, recover, forget, rosterHome };
   }
 
   const api = { open, safePath, PROGRAM };

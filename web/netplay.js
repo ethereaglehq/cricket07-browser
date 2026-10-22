@@ -197,29 +197,43 @@
         }
         opts.onStart?.(m);
       }
-      else if (m.t === 'files' && m.size <= MAX_FILES) {
-        incoming.set(m.id, { hash: m.hash, size: m.size, parts: new Array(m.n), got: 0 });
+      else if (m.t === 'files') {
+        // One bundle at a time, of at most MAX_FILES, in exactly the chunks its size implies: a hostile host
+        // (or a hostile room server, through a crafted invite link) can't make this page hold more.
+        const n = Math.ceil(m.size / CHUNK);
+        if (!(Number.isInteger(m.size) && m.size > 0 && m.size <= MAX_FILES && m.n === n && typeof m.id === 'string' &&
+          /^[0-9a-f]{16}$/.test(m.id) && /^[0-9a-f]{64}$/.test(m.hash))) return;
+        incoming.clear();
+        received.clear();
+        incoming.set(m.id, { hash: m.hash, size: m.size, parts: new Array(n), got: 0 });
         opts.onFiles?.(0, m.size);
       } else if (m.t === 'chunk') {
         const f = incoming.get(m.id);
-        if (!f || f.parts[m.k] || !(m.k >= 0 && m.k < f.parts.length)) return;
-        f.parts[m.k] = b64d(m.data);
+        if (!f || !Number.isInteger(m.k) || m.k < 0 || m.k >= f.parts.length || f.parts[m.k] || typeof m.data !== 'string') return;
+        const want = m.k < f.parts.length - 1 ? CHUNK : f.size - CHUNK * (f.parts.length - 1);
+        let part = null;
+        if (m.data.length === Math.ceil(want / 3) * 4) try { part = b64d(m.data); } catch { /* not base64 */ }
+        if (!part || part.length !== want) {
+          incoming.delete(m.id);
+          opts.onError?.('The host\'s saves arrived damaged; ask them to start again.');
+          return;
+        }
+        f.parts[m.k] = part;
         opts.onFiles?.(++f.got / f.parts.length, f.size);
         if (f.got === f.parts.length) {
           incoming.delete(m.id);
-          const damaged = () => opts.onError?.('The host\'s saves arrived damaged; ask them to start again.');
-          if (f.parts.reduce((s, part) => s + part.length, 0) !== f.size) { damaged(); return; }
           const bytes = new Uint8Array(f.size);
           let at = 0;
-          for (const part of f.parts) { bytes.set(part, at); at += part.length; }
+          for (const p of f.parts) { bytes.set(p, at); at += p.length; }
           sha256(bytes).then((h) => {
-            if (h !== f.hash) { damaged(); return; }
+            if (h !== f.hash) { opts.onError?.('The host\'s saves arrived damaged; ask them to start again.'); return; }
+            received.clear();
             received.set(m.id, bytes);
             send({ t: 'files-ok', id: m.id, hash: h });
             opts.onFiles?.(1, f.size, true);
           });
         }
-      } else if (m.t === 'files-ok') acks.get(m.id)?.add(m.from);
+      } else if (m.t === 'files-ok' && m.id === offered?.id) acks.get(m.id)?.add(m.from);
       else if (m.t === 'rejoined') {   // back in the game: resend what may have been lost
         for (const text of history) ws.send(text);
         opts.onReconnect?.('rejoined');
@@ -267,6 +281,7 @@
         if (bytes.length > MAX_FILES) throw new Error(`too big to send (${Math.round(bytes.length / 1e6)} MB)`);
         const hash = await sha256(bytes), id = hash.slice(0, 16), n = Math.max(1, Math.ceil(bytes.length / CHUNK));
         offered = { id, hash, size: bytes.length, bytes };
+        acks.clear();
         acks.set(id, new Set());
         send({ t: 'files', id, hash, size: bytes.length, n });
         for (let k = 0; k < n; k++) {

@@ -58,8 +58,8 @@ match need the same build and the same game files.
   folder you pick. The game only keeps what you save in My Cricket → Load / Save.
 - **Patches** (kits, faces, stadiums, overlays, bat packs) and **rosters** (`.ros` folders) install from
   "Patches & rosters": choose the patch's folder or .zip, laid out like the game folder. Only game data is
-  installed, never programs (`.exe`, `.dll`, scripts), so patches that need a modified game executable
-  can't work here. Patches come off again, newest first. A patch that ships as an installer `.exe` can
+  installed: programs (`.exe`, `.dll`, scripts, or any file that starts like one) are refused, so patches
+  that need a modified game executable can't work here. Patches come off again, newest first. A patch that ships as an installer `.exe` can
   usually be unpacked without running it: The Unarchiver or `innoextract` on a Mac, 7-Zip on Windows.
 - **Online**, both players need the same patches (the lobby says when they differ), and the host can
   bring their saves, rosters included: every game then starts from the host's saves.

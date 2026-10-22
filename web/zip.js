@@ -74,19 +74,23 @@
   }
 
   // Inflates at most `limit` bytes: a damaged or hostile entry that unpacks to more than it declares is
-  // stopped there instead of filling memory.
+  // stopped there instead of filling memory. Memory follows the data that actually arrives, not the
+  // declared size, so a small archive can't make the page reserve gigabytes.
   async function inflate(bytes, limit) {
     const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader();
-    const out = new Uint8Array(limit);
+    const parts = [];
     let n = 0;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (n + value.length > limit) { reader.cancel().catch(() => {}); throw new Error('larger than declared'); }
-      out.set(value, n);
       n += value.length;
+      if (n > limit) { reader.cancel().catch(() => {}); throw new Error('larger than declared'); }
+      parts.push(value);
     }
-    return out.subarray(0, n);
+    const out = new Uint8Array(n);
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.length; }
+    return out;
   }
 
   async function read(blob) {

@@ -280,6 +280,8 @@ function showNetStatus(M, session) {
 async function run(session) {
   $('panel').classList.add('hidden');
   fullscreenTip();
+  // the game has its files open from now on: no other tab may restore saves or change patches until this one closes
+  navigator.locks?.request('rc-game-files', () => new Promise(() => {})).catch(() => {});
   if (session) {
     await clearNetSaves(session);
     // the saves the host brought: every game unpacks the same bytes, so all start alike
@@ -466,7 +468,7 @@ function savesMsg(text, undo) {
   b.className = 'linkish';
   b.textContent = 'Undo';
   b.onclick = async () => {
-    try { savesMsg(await saves.undo() ? 'Your earlier saves are back.' : 'Nothing to undo.'); }
+    try { savesMsg(await RcSaves.exclusive(() => saves.undo()) ? 'Your earlier saves are back.' : 'Nothing to undo.'); }
     catch (e) { savesMsg(`Undo failed: ${e.message}`); }
     showSaves();
   };
@@ -533,7 +535,7 @@ function setupSaves() {
     if (!file) return;
     const s = await saves.summary();
     if (s.files && !confirm(`Replace your ${s.files} saved files with the backup “${file.name}”? You can undo this afterwards.`)) return;
-    try { savesMsg(`Restored ${await saves.restoreZip(file)} files from ${file.name}.`, true); }
+    try { savesMsg(`Restored ${await RcSaves.exclusive(() => saves.restoreZip(file))} files from ${file.name}.`, true); }
     catch (err) { savesMsg(err.message); }
     showSaves();
   };
@@ -549,7 +551,7 @@ function patchMsg(text, warn) {
 }
 
 async function showPatches() {
-  const list = await patches.list().catch(() => []);
+  const list = (await patches.list().catch(() => [])).filter((p) => !p.installing);
   const ul = $('patch-list');
   ul.innerHTML = '';
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
@@ -597,7 +599,7 @@ async function planPatch(source, name) {
 async function removePatch(p) {
   if (!confirm(`Remove “${p.name}”? The game files it replaced are put back.`)) return;
   try {
-    await patches.uninstallLast(({ done, total }) => patchMsg(`Removing… ${done} of ${total}`));
+    await RcSaves.exclusive(() => patches.uninstallLast(({ done, total }) => patchMsg(`Removing… ${done} of ${total}`)));
     patchMsg(`Removed “${p.name}”.`);
   } catch (e) { patchMsg(e.message, true); }
   showPatches();
@@ -616,20 +618,22 @@ function setupPatches() {
     e.target.value = '';
   };
   $('patch-cancel').onclick = () => { pendingPlan = null; $('patch-plan').classList.add('hidden'); };
+  // an install the last visit didn't finish (the tab closed part way) is undone first
+  RcSaves.exclusive(() => patches.recover()).then((r) => r && console.log(`patches: undid the unfinished install of ${r.name}`))
+    .catch(() => {}).finally(showPatches);
   $('patch-install').onclick = async () => {
     const p = pendingPlan;
     if (!p) return;
     $('patch-install').disabled = true;
     try {
-      await patches.install(p, ({ done, total, file }) => patchMsg(`Installing ${done} of ${total}${file ? `: ${file}` : ''}`));
+      await RcSaves.exclusive(() => patches.install(p, ({ done, total, file }) => patchMsg(`Installing ${done} of ${total}${file ? `: ${file}` : ''}`)));
       $('patch-plan').classList.add('hidden');
       patchMsg(`Installed “${p.name}”. It shows the next time the game starts.`);
-    } catch (e) { patchMsg(`Not installed: ${e.message}`, true); }
+      pendingPlan = null;
+    } catch (e) { patchMsg(`Not installed: ${e.message}`, true); }   // the plan stays, to try again
     $('patch-install').disabled = false;
-    pendingPlan = null;
     showPatches();
   };
-  showPatches();
 }
 
 // ------------------------------------------------------------------ online lobby
@@ -651,6 +655,8 @@ function setupOnline() {
     if ([...$('np-region').options].some((o) => o.value === region)) $('np-region').value = region;
   } catch { /* storage blocked */ }
   if (params.get('join')) $('np-code').value = params.get('join').toUpperCase();
+  // an invite link can name another room server: say which, so a stranger's server doesn't go unnoticed
+  if (params.get('netplay')) { $('np-server').textContent = `Room server: ${new URL(NETPLAY_BASE).host}`; $('np-server').classList.remove('hidden'); }
   let client = null;
   let lastPlayers = [];
   let bringChecked = false;   // the host's saves summary for "Bring my saves", looked up once

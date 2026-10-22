@@ -446,6 +446,101 @@ test('online: without "Bring my saves" both games start fresh', async ({ browser
   assert.deepStrictEqual(await savesAtStart(guest), []);
 }, { online: true });
 
+// ---- hostile input (from the security review)
+
+test('netplay: a hostile host or room server cannot flood a guest with save chunks', async () => {
+  // web/netplay.js driven directly, with a stand-in WebSocket whose "server" is this test
+  const sockets = [];
+  global.WebSocket = class { constructor(url) { this.url = url; this.readyState = 1; this.bufferedAmount = 0; this.sent = []; sockets.push(this); setTimeout(() => this.onopen?.(), 0); }
+    send(t) { this.sent.push(t); } close() { this.readyState = 3; } };
+  const np = require('../../web/netplay.js');
+  const errors = [], progress = [];
+  const c = np.connect({ url: 'ws://test', name: 'guest', version: 'v', onError: (e) => errors.push(e), onFiles: (f) => progress.push(f), onLobby() {} });
+  await sleep(10);
+  const ws = sockets[0], say = (m) => ws.onmessage({ data: JSON.stringify(m) });
+  say({ t: 'lobby', you: 1, host: false, players: [{ slot: 0 }, { slot: 1 }] });
+  const big = 'A'.repeat(4 * 256 * 1024);   // 1 MB of base64 per chunk
+  const before = process.memoryUsage().heapUsed;
+  // a declared size of 1 byte in a billion chunks: refused outright
+  say({ t: 'files', id: '0123456789abcdef', hash: 'a'.repeat(64), size: 1, n: 1e9 });
+  for (let k = 0; k < 150; k++) say({ t: 'chunk', id: '0123456789abcdef', k, data: big });
+  // a valid announcement, then chunks of the wrong size: dropped at the first
+  say({ t: 'files', id: '0123456789abcdee', hash: 'b'.repeat(64), size: 3 * 192 * 1024, n: 3 });
+  for (let k = 0; k < 150; k++) say({ t: 'chunk', id: '0123456789abcdee', k: k % 3, data: big });
+  global.gc?.();
+  const grown = (process.memoryUsage().heapUsed - before) / 1e6;
+  assert.ok(grown < 40, `guest held ${grown.toFixed(0)} MB`);
+  assert.ok(errors.some((e) => /damaged/.test(e)), 'wrong-size chunk not reported');
+  assert.deepStrictEqual(progress, [0]);   // only the valid announcement registered, no chunk accepted
+  c.close();
+  delete global.WebSocket;
+});
+
+test('zip: an entry claiming a huge size is not allocated up front', async () => {
+  // a few KB of deflated zeros that declare 900 MB when unpacked
+  const zip = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'c07-big-')), 'claims.zip');
+  require('child_process').execFileSync('python3', ['-I', '-c', `
+import zipfile, sys, struct
+with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z: z.writestr('a.bin', b'\\0' * 200000)
+b = bytearray(open(sys.argv[1], 'rb').read())
+b[22:26] = struct.pack('<I', 900 << 20); cd = b.rfind(b'PK\\x01\\x02'); b[cd + 24:cd + 28] = struct.pack('<I', 900 << 20)
+open(sys.argv[1], 'wb').write(b)`, zip]);
+  const before = process.memoryUsage().rss;
+  const [e] = await RcZip.read(new Blob([fs.readFileSync(zip)]));
+  await assert.rejects(e.read(), /damaged/);
+  assert.ok(process.memoryUsage().rss - before < 300e6, 'reader reserved the declared size');
+});
+
+test('patches: an install cut short by closing the tab is undone on the next visit', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  const original = await gameFolder(page);
+  // the second file is big enough to still be copying when the page goes away
+  const patch = makePatch('Big', { 'Data/data.gob': 'replaced archive', 'Data/zz-big.fsh': Buffer.alloc(120e6, 7), 'Data/zzz.fsh': 'last' });
+  await planPatch(page, '#patch-folder', patch);
+  await page.click('#patch-install');
+  await page.waitForFunction(() => /Installing [12] of 3/.test(document.getElementById('patch-msg').textContent));
+  await page.reload();   // as if the tab closed mid-install
+  await page.waitForSelector('#view-home:not(.hidden)');
+  await page.waitForFunction(async () => !(await RcPatches.open().list()).length);
+  const now = await gameFolder(page);
+  delete now['.installed.json']; delete original['.installed.json'];
+  assert.deepStrictEqual(now, original, 'game folder not restored');
+  assert.match(await page.textContent('#go-patches'), /^Patches & rosters$/);
+});
+
+test('patches and saves: no changes while the game runs in another tab', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  await playAndSave(page, 1);
+  const file = await download(page);
+  const other = await page.context().newPage();
+  await other.goto(base);
+  await other.waitForSelector('#view-home:not(.hidden)');
+  await other.click('#play');   // the game runs in the second tab
+  await waitFrames(other, 5);
+  page.on('dialog', (d) => d.accept());
+  await page.setInputFiles('#saves-import', file);
+  await page.waitForFunction(() => /open in another tab/.test(document.getElementById('saves-msg').textContent), null, { timeout: 5000 })
+    .catch(async (e) => { throw new Error(`saves-msg: "${await page.textContent('#saves-msg')}" ${e.message}`); });
+  await page.click('#go-patches');
+  await planPatch(page, '#patch-folder', makePatch('P', { 'Data/x.fsh': 'x' }));
+  await page.click('#patch-install');
+  await page.waitForFunction(() => /open in another tab/.test(document.getElementById('patch-msg').textContent), null, { timeout: 5000 })
+    .catch(async (e) => { throw new Error(`patch-msg: "${await page.textContent('#patch-msg')}" plan hidden: ${await page.isHidden('#patch-plan')} ${e.message}`); });
+  await other.close();
+  await sleep(300);   // the closed tab lets go of the lock
+  await page.click('#patch-install');
+  await page.waitForFunction(() => /Installed “P”/.test(document.getElementById('patch-msg').textContent));
+});
+
+test('patches: a patch may not overwrite the page\'s own marker file', async ({ browser, base }) => {
+  const page = await player(browser, base);
+  await install(page);
+  const plan = await planPatch(page, '#patch-folder', makePatch('Sneaky', { '.installed.json': '{"version":"forged"}', 'Data/ok.fsh': 'ok' }));
+  assert.match(plan, /\.installed\.json \(a name this page uses itself\)/);
+});
+
 test('online: two players stay in lockstep', async ({ browser, base, netplay }) => {
   const q = `?netplay=${encodeURIComponent(netplay)}`;
   const host = await player(browser, base + q, 'host');

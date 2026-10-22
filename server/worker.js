@@ -32,6 +32,7 @@ function timingSafeEqual(a, b) {
 // ------------------------------------------------------------------ tickets and ICE servers
 
 const TICKET_SECONDS = 3600;
+const FILES_PER_ROOM = 160e6;   // bytes of the host's saves a room relays (base64), over all attempts
 
 // Tickets are HMAC-signed with the NETPLAY_SECRET secret (any random string), so a room can't be opened
 // without fetching a ticket first.
@@ -172,6 +173,9 @@ export class NetplayRoom {
     }
     // the saves the host brings to the match, in chunks, before the start; each player confirms to the host
     if ((msg.t === 'files' || msg.t === 'chunk') && me.slot === 0 && !(await this.ctx.storage.get('started'))) {
+      // a chunk is 192 KB as base64 plus a little; a room relays a few bundles' worth at most
+      this.relayed = (this.relayed || 0) + data.length;
+      if (data.length > 300000 || this.relayed > FILES_PER_ROOM) { this.send(ws, { t: 'error', msg: 'Too much data sent through this room.' }); return; }
       for (const p of this.peers()) if (p.slot !== me.slot) try { p.ws.send(data); } catch { /* closed */ }
       return;
     }

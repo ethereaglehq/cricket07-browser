@@ -19,8 +19,9 @@
 
   const MANIFEST = 'cricket07-saves.json';
   const KEEP = 10;                 // dated backups kept in the backup folder
-  const MAX_FILE = 256 << 20;      // a save bigger than this is not a save
-  const MAX_TOTAL = 1 << 30;
+  const MAX_FILE = 64 << 20;       // a save bigger than this is not a save
+  const MAX_TOTAL = 256 << 20;
+  const MAX_UNPACK = 48 << 20;     // an online bundle: netplay.js sends at most 32 MB, stored uncompressed
   const DATED = /^Cricket 07 saves (\d{4}-\d{2}-\d{2})\.zip$/;
 
   const today = () => new Date().toISOString().slice(0, 10);
@@ -225,7 +226,7 @@
   // player does this with the same bytes, so every game starts from the same saves (lockstep needs that).
   async function unpack(bytes, dirName) {
     const entries = (await RcZip.read(new Blob([bytes]))).filter((e) => e.path !== MANIFEST);
-    if (entries.some((e) => !safePath(e.path)) || entries.reduce((s, e) => s + e.size, 0) > MAX_TOTAL) throw new Error('The saves bundle is not usable.');
+    if (entries.some((e) => !safePath(e.path)) || entries.reduce((s, e) => s + e.size, 0) > MAX_UNPACK) throw new Error('The saves bundle is not usable.');
     const top = await navigator.storage.getDirectory();
     await removeDir(top, dirName);
     const dir = await top.getDirectoryHandle(dirName, { create: true });
@@ -233,7 +234,18 @@
     return entries.length;
   }
 
-  const api = { open, unpack, safePath, MANIFEST };
+  // Changes to the saves or the game folder (restore, undo, patches) take this lock, so two tabs never
+  // interleave them; a tab where the game runs holds it as long as it is open (loader.js run), since the
+  // game has those files open. Fails at once rather than wait: the player is told to close the other tab.
+  async function exclusive(fn) {
+    if (!navigator.locks) return fn();
+    return navigator.locks.request('rc-game-files', { ifAvailable: true }, async (lock) => {
+      if (!lock) throw new Error('The game is open in another tab (or that tab is busy): close it, then try again.');
+      return fn();
+    });
+  }
+
+  const api = { open, unpack, exclusive, safePath, MANIFEST };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.RcSaves = api;
 })(typeof self !== 'undefined' ? self : this);
