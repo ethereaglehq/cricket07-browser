@@ -62,7 +62,9 @@ match need the same build and the same game files.
   that need a modified game executable can't work here. Patches come off again, newest first. A patch that ships as an installer `.exe` can
   usually be unpacked without running it: The Unarchiver or `innoextract` on a Mac, 7-Zip on Windows.
 - **Online**, both players need the same patches (the lobby says when they differ), and the host can
-  bring their saves, rosters included: every game then starts from the host's saves.
+  bring their saves, rosters included: every game then starts from the host's saves. Each player's keyboard
+  works as their own controller, and the mouse is shared: both players move the one cursor, and either can
+  click (some screens, such as Innings Highlights between innings, only answer the mouse).
 
 ## Testing the page without the game
 
