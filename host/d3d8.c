@@ -10,6 +10,7 @@
 #define W(name) static void name(CPU *c)
 #define D3DERR_NOTAVAILABLE 0x8876086Au
 #define D3DERR_INVALIDCALL 0x8876086Cu
+#define D3DERR_OUTOFVIDEOMEMORY 0x8876017Cu
 
 RenderBackend *g_render = &g_render_headless;
 uint8_t g_palettes[1024][1024];   /* PALETTEENTRY r, g, b, flags (alpha) x 256 per palette */
@@ -37,6 +38,12 @@ static uint32_t level_pitch(uint32_t f, uint32_t w) {
 }
 
 static uint32_t level_rows(uint32_t f, uint32_t h) { return format_is_dxt(f) ? (h + 3) / 4 : h; }
+
+/* Texture keeps 14 levels per face (d3d8.h): the whole mip chain of anything up to 16383 wide and high. 16384 needs
+   15, and the extra levels were written over the fields after the arrays. Larger sizes, and 0, fail with
+   D3DERR_INVALIDCALL as on Windows; on surfaces the same limit keeps pitch * rows (at most 1 GiB) from wrapping. */
+#define MAX_DIM 16383u
+static int bad_dim(uint32_t w, uint32_t h) { return !w || !h || w > MAX_DIM || h > MAX_DIM; }
 
 static int supported_format(uint32_t f) {
     switch (f) {
@@ -157,9 +164,15 @@ W(d3d_CreateDevice) {
     fprintf(stderr, "[d3d] CreateDevice: %ux%u fmt %u, %s, backbuffers %u, multisample %u, swap %u, depth %u, "
             "behavior %x, flags %x\n", d->width, d->height, d->backbuffer_format, d->windowed ? "windowed" : "fullscreen",
             R32(pp + 12), R32(pp + 16), R32(pp + 20), d->depth_format, ARG(4), R32(pp + 40));
+    if (bad_dim(d->width, d->height)) { free(d); W32(out, 0); RET(7, D3DERR_INVALIDCALL); }
     if (R32(pp) == 0) { W32(pp, d->width); W32(pp + 4, d->height); }
     d->backbuffer = new_surface(d->backbuffer_format, d->width, d->height, 1, 0, 0);
     if (d->depth_format) d->depth = new_surface(d->depth_format, d->width, d->height, 0, 1, 0);
+    if (!d->backbuffer || (d->depth_format && !d->depth)) {   /* more than the guest heap holds */
+        com_release(d->backbuffer); com_release(d->depth); free(d);
+        W32(out, 0);
+        RET(7, D3DERR_OUTOFVIDEOMEMORY);
+    }
     d->st.render_target = d->backbuffer;
     d->st.depth_stencil = d->depth;
     /* Direct3D 8's documented default states (D3DRENDERSTATETYPE / D3DTEXTURESTAGESTATETYPE numbering) */
@@ -234,18 +247,35 @@ uint32_t gpu_new_id(void) {
     return __atomic_fetch_add(&next, 1, __ATOMIC_SEQ_CST);
 }
 
+/* The caller checks the size (bad_dim). 0 when the surface's memory doesn't fit in the guest heap. */
 static uint32_t new_surface(uint32_t fmt, uint32_t w, uint32_t h, int rt, int depth, int with_mem) {
     Surface *s = calloc(1, sizeof *s);
     s->gpu_id = gpu_new_id();
     s->format = fmt; s->width = w; s->height = h;
     s->pitch = level_pitch(fmt, w);
     s->is_rt = rt; s->is_depth = depth;
-    if (with_mem || rt || depth) s->mem = heap_alloc(s->pitch * level_rows(fmt, h) + 16, 1);
+    if (with_mem || rt || depth) {
+        s->mem = heap_alloc(s->pitch * level_rows(fmt, h) + 16, 1);
+        if (!s->mem) { free(s); return 0; }
+    }
     return com_new(&IDirect3DSurface8_i, RT_SURFACE, s);
 }
 
-static uint32_t create_texture(uint32_t w, uint32_t h, uint32_t levels, uint32_t usage, uint32_t fmt,
+/* CreateRenderTarget, CreateDepthStencilSurface, CreateImageSurface: the new surface, or NULL, to the game's `out` */
+static uint32_t create_surface(uint32_t out, uint32_t fmt, uint32_t w, uint32_t h, int rt, int depth, int with_mem) {
+    W32(out, 0);
+    if (bad_dim(w, h)) return D3DERR_INVALIDCALL;
+    uint32_t s = new_surface(fmt, w, h, rt, depth, with_mem);
+    W32(out, s);
+    return s ? S_OK : D3DERR_OUTOFVIDEOMEMORY;
+}
+
+static void destroy_texture(void *p);
+/* CreateTexture, CreateCubeTexture: the new texture, or NULL, to the game's `out` */
+static uint32_t create_texture(uint32_t out, uint32_t w, uint32_t h, uint32_t levels, uint32_t usage, uint32_t fmt,
                                uint32_t pool, int cube) {
+    W32(out, 0);
+    if (bad_dim(w, h)) return D3DERR_INVALIDCALL;
     Texture *t = calloc(1, sizeof *t);
     t->gpu_id = gpu_new_id();
     t->sent_version = 0xFFFFFFFFu;
@@ -260,12 +290,14 @@ static uint32_t create_texture(uint32_t w, uint32_t h, uint32_t levels, uint32_t
         t->lw[l] = lw; t->lh[l] = lh;
         t->pitch[l] = level_pitch(fmt, lw);
         t->size[l] = t->pitch[l] * level_rows(fmt, lh);
-        for (uint32_t f = 0; f < t->faces; f++) t->mem[f][l] = heap_alloc(t->size[l] + 16, 1);
+        for (uint32_t f = 0; f < t->faces; f++)
+            if (!(t->mem[f][l] = heap_alloc(t->size[l] + 16, 1))) { destroy_texture(t); return D3DERR_OUTOFVIDEOMEMORY; }
     }
     uint32_t g = com_new(cube ? &IDirect3DCubeTexture8_i : &IDirect3DTexture8_i, t->type, t);
     if (g_log_d3d) fprintf(stderr, "[d3d] Create%sTexture %ux%u levels %u fmt %x usage %x pool %u -> %08x\n",
                            cube ? "Cube" : "", w, h, t->levels, fmt, usage, pool, g);
-    return g;
+    W32(out, g);
+    return S_OK;
 }
 
 /* ------------------------------------------------------------------ IDirect3DDevice8 */
@@ -409,30 +441,29 @@ W(dev_GetGammaRamp) {
     for (int i = 0; i < 256; i++) for (int k = 0; k < 3; k++) W16(ARG(1) + 512u * k + 2u * i, (uint16_t)(i * 257));
     RET(2, S_OK);
 }
-W(dev_CreateTexture) {
-    W32(ARG(7), create_texture(ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), 0));
-    RET(8, S_OK);
-}
-W(dev_CreateCubeTexture) {
-    W32(ARG(6), create_texture(ARG(1), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), 1));
-    RET(7, S_OK);
-}
+W(dev_CreateTexture) { RET(8, create_texture(ARG(7), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), 0)); }
+W(dev_CreateCubeTexture) { RET(7, create_texture(ARG(6), ARG(1), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), 1)); }
 W(dev_CreateVolumeTexture) {
     fprintf(stderr, "[d3d] CreateVolumeTexture is not supported\n");
     RET(9, D3DERR_NOTAVAILABLE);
 }
-static uint32_t create_buffer(int index, uint32_t len, uint32_t usage, uint32_t fvf_fmt, uint32_t pool) {
+static uint32_t create_buffer(uint32_t out, int index, uint32_t len, uint32_t usage, uint32_t fvf_fmt, uint32_t pool) {
+    W32(out, 0);
+    /* len + 16 wrapped to a small block for lengths near 4 GiB: those fail, like any the guest heap can't hold */
+    uint32_t mem = len < 0xFFFFFFF0u ? heap_alloc(len + 16, 1) : 0;
+    if (!mem) return D3DERR_OUTOFVIDEOMEMORY;
     Buffer *b = calloc(1, sizeof *b);
     b->index = index; b->size = len; b->usage = usage; b->fvf_or_format = fvf_fmt; b->pool = pool;
-    b->mem = heap_alloc(len + 16, 1);
-    return com_new(index ? &IDirect3DIndexBuffer8_i : &IDirect3DVertexBuffer8_i,
-                   index ? RT_INDEXBUFFER : RT_VERTEXBUFFER, b);
+    b->mem = mem;
+    W32(out, com_new(index ? &IDirect3DIndexBuffer8_i : &IDirect3DVertexBuffer8_i,
+                     index ? RT_INDEXBUFFER : RT_VERTEXBUFFER, b));
+    return S_OK;
 }
-W(dev_CreateVertexBuffer) { W32(ARG(5), create_buffer(0, ARG(1), ARG(2), ARG(3), ARG(4))); RET(6, S_OK); }
-W(dev_CreateIndexBuffer) { W32(ARG(5), create_buffer(1, ARG(1), ARG(2), ARG(3), ARG(4))); RET(6, S_OK); }
-W(dev_CreateRenderTarget) { W32(ARG(6), new_surface(ARG(3), ARG(1), ARG(2), 1, 0, 1)); RET(7, S_OK); }
-W(dev_CreateDepthStencilSurface) { W32(ARG(5), new_surface(ARG(3), ARG(1), ARG(2), 0, 1, 0)); RET(6, S_OK); }
-W(dev_CreateImageSurface) { W32(ARG(4), new_surface(ARG(3), ARG(1), ARG(2), 0, 0, 1)); RET(5, S_OK); }
+W(dev_CreateVertexBuffer) { RET(6, create_buffer(ARG(5), 0, ARG(1), ARG(2), ARG(3), ARG(4))); }
+W(dev_CreateIndexBuffer) { RET(6, create_buffer(ARG(5), 1, ARG(1), ARG(2), ARG(3), ARG(4))); }
+W(dev_CreateRenderTarget) { RET(7, create_surface(ARG(6), ARG(3), ARG(1), ARG(2), 1, 0, 1)); }
+W(dev_CreateDepthStencilSurface) { RET(6, create_surface(ARG(5), ARG(3), ARG(1), ARG(2), 0, 1, 0)); }
+W(dev_CreateImageSurface) { RET(5, create_surface(ARG(4), ARG(3), ARG(1), ARG(2), 0, 0, 1)); }
 W(dev_CreateAdditionalSwapChain) { RET(3, D3DERR_NOTAVAILABLE); }
 
 static void touch_container(Surface *s) {

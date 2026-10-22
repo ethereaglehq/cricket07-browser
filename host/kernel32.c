@@ -382,6 +382,14 @@ W(GetTimeFormatA) {
 
 /* ------------------------------------------------------------------ memory */
 
+/* No room in guest memory (a full VirtualAlloc window, a block bigger than the whole heap): fail the call as
+   Windows does, and say so (the game may not check). */
+static void out_of_space(const char *what, uint32_t size) {
+    static int n;
+    if (n++ < 20) fprintf(stderr, "[kernel32] %s: out of guest address space (%u MB requested)\n", what, size >> 20);
+    set_error(8 /* ERROR_NOT_ENOUGH_MEMORY */);
+}
+
 #define HEAP_HANDLE 0x00A70000u
 /* Every heap is the one guest heap, so HeapDestroy frees nothing: a game that destroys a heap instead of
    freeing its blocks leaks them. Counted for the [mem] log, to see whether that happens. */
@@ -389,23 +397,27 @@ uint32_t g_heaps_created, g_heaps_destroyed;
 W(HeapCreate) { g_heaps_created++; LOG("[kernel32] HeapCreate(%x, %u, %u)\n", ARG(0), ARG(1), ARG(2)); RET(3, HEAP_HANDLE); }
 W(HeapDestroy) { g_heaps_destroyed++; LOG("[kernel32] HeapDestroy(%x): its blocks stay allocated\n", ARG(0)); RET(1, 1); }
 W(GetProcessHeap) { RET(0, HEAP_HANDLE); }
-W(HeapAlloc) { RET(3, heap_alloc(ARG(2), ARG(1) & 8)); }
+W(HeapAlloc) {
+    uint32_t a = heap_alloc(ARG(2), ARG(1) & 8);
+    if (!a) out_of_space("HeapAlloc", ARG(2));
+    RET(3, a);
+}
 W(HeapFree) { heap_free(ARG(2)); RET(3, 1); }
 W(HeapReAlloc) {
     if (ARG(1) & 0x10 /* HEAP_REALLOC_IN_PLACE_ONLY */) RET(4, heap_size(ARG(2)) >= ARG(3) ? ARG(2) : 0);
-    RET(4, heap_realloc(ARG(2), ARG(3), ARG(1) & 8));
+    uint32_t a = heap_realloc(ARG(2), ARG(3), ARG(1) & 8);
+    if (!a) out_of_space("HeapReAlloc", ARG(3));
+    RET(4, a);
 }
 W(HeapSize) { RET(3, heap_size(ARG(2))); }
-W(GlobalAlloc) { RET(2, heap_alloc(ARG(1), ARG(0) & 0x40)); }
+W(GlobalAlloc) {
+    uint32_t a = heap_alloc(ARG(1), ARG(0) & 0x40);
+    if (!a) out_of_space("GlobalAlloc", ARG(1));
+    RET(2, a);
+}
 W(GlobalFree) { heap_free(ARG(0)); RET(1, 0); }
 W(LocalFree) { heap_free(ARG(0)); RET(1, 0); }
 
-/* The VirtualAlloc window is full: fail the call as Windows does, and say so (the game may not check). */
-static void out_of_space(const char *what, uint32_t size) {
-    static int n;
-    if (n++ < 20) fprintf(stderr, "[kernel32] %s: out of guest address space (%u MB requested)\n", what, size >> 20);
-    set_error(8 /* ERROR_NOT_ENOUGH_MEMORY */);
-}
 W(VirtualAlloc) {
     uint32_t addr = ARG(0), size = ARG(1);
     if (addr) RET(4, addr);  /* committing inside a region we already handed out */

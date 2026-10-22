@@ -14,6 +14,9 @@
 #define W(name) static void name(CPU *c)
 #define DSERR_NODRIVER 0x88780078u
 #define DSERR_INVALIDPARAM 0x80070057u
+#define DSERR_OUTOFMEMORY 0x8007000Eu
+#define DSBSIZE_MIN 4u
+#define DSBSIZE_MAX 0x0FFFFFFFu
 #define MIX_RATE 44100
 
 void kernel_set_event(uint32_t h);  /* kernel32.c */
@@ -362,6 +365,7 @@ static ComInterface IDirectSound3DListener_i = { "IDirectSound3DListener", l3d_m
 
 /* ------------------------------------------------------------------ IDirectSound */
 
+/* 0 when the sound data doesn't fit in the guest heap */
 static uint32_t new_buffer(uint32_t desc) {
     SBuf *b = calloc(1, sizeof *b);
     b->flags = R32(desc + 4);
@@ -372,7 +376,10 @@ static uint32_t new_buffer(uint32_t desc) {
     if (wfx) { b->channels = R16(wfx + 2); b->rate = R32(wfx + 4); b->bits = R16(wfx + 14); }
     b->freq = b->rate;
     b->refs = 1;
-    if (!b->primary && b->size) { b->mem = heap_alloc(b->size + 16, 1); b->mem_users = malloc(sizeof *b->mem_users); *b->mem_users = 1; }
+    if (!b->primary && b->size) {
+        if (!(b->mem = heap_alloc(b->size + 16, 1))) { free(b); return 0; }
+        b->mem_users = malloc(sizeof *b->mem_users); *b->mem_users = 1;
+    }
     pthread_mutex_lock(&g_snd_lock);
     b->next = g_bufs;
     g_bufs = b;
@@ -383,7 +390,17 @@ static uint32_t new_buffer(uint32_t desc) {
     return com_new(&IDirectSoundBuffer_i, 0, b);
 }
 
-W(ds_CreateSoundBuffer) { W32(ARG(2), new_buffer(ARG(1))); RET(4, S_OK); }
+/* A secondary buffer's size comes from the game's sound data: outside DirectSound's limits it fails, as on Windows,
+   before any arithmetic on it (size + 16 wrapped to a 16-byte block for sizes near 4 GiB). */
+W(ds_CreateSoundBuffer) {
+    uint32_t desc = ARG(1), size = R32(desc + 8);
+    W32(ARG(2), 0);
+    if (!(R32(desc + 4) & 1 /* DSBCAPS_PRIMARYBUFFER */) && (size < DSBSIZE_MIN || size > DSBSIZE_MAX))
+        RET(4, DSERR_INVALIDPARAM);
+    uint32_t b = new_buffer(desc);
+    W32(ARG(2), b);
+    RET(4, b ? S_OK : DSERR_OUTOFMEMORY);
+}
 W(ds_GetCaps) {
     uint32_t p = ARG(1), sz = R32(p);
     memset(HP(p + 4), 0, sz > 4 ? sz - 4 : 0);

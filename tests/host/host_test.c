@@ -1,7 +1,8 @@
 /* Native tests for the Windows layer's resource handling (host/, runtime/), without the game: they call the
  * import handlers and COM methods the way the game does (stdcall, arguments on the guest stack) and check what a
  * long session depends on: memory and address space given back and reused, threads that end, critical sections,
- * GetProcAddress, dynamic code regions, Direct3D surface levels and DirectSound buffers.
+ * GetProcAddress, dynamic code regions, Direct3D surface levels and DirectSound buffers. Also that sizes nothing can
+ * hold, as a corrupt data file can give them, fail as they do on Windows.
  *
  *   tests/host/run.sh
  */
@@ -64,6 +65,8 @@ static uint32_t comv(uint32_t obj, const char *method, int n, const uint32_t *a)
 }
 #define COM(obj, method, ...) comv(obj, method, ARGS(__VA_ARGS__))
 static uint32_t release(uint32_t obj) { return comv(obj, "Release", 0, NULL); }
+/* A create call that must fail with `hr` and leave NULL in the game's pointer at `out` */
+#define CREATE_FAILS(hr, out, obj, method, ...) (W32(out, 0xDEADBEEFu), COM(obj, method, __VA_ARGS__) == (hr) && !R32(out))
 
 static uint32_t gstr(const char *s) { return guest_strdup(s); }
 static uint32_t gbuf(uint32_t n) { return heap_alloc(n, 1); }
@@ -94,6 +97,39 @@ static void test_heap(void) {
     uint32_t x = heap_alloc(20 << 10, 0);
     CHECK(x == b, "best fit takes the 32 KB block (%08x), not the 64 KB one (%08x): got %08x", b, a, x);
     heap_free(x); heap_free(sep); heap_free(sep2);
+}
+
+/* Sizes as a corrupt data file can give them. One near 4 GiB wrapped the heap's top around, so the next block went
+   over live ones; one that rounds up past 4 GiB took the first freed large block, whatever its size. */
+static void test_heap_limits(void) {
+    uint32_t used0, used, v;
+    guest_mem_stats(&used0, &v);
+    CHECK(!heap_alloc(0xFFFFFF00u, 0), "a block bigger than the whole heap is refused");
+    guest_mem_stats(&used, &v);
+    CHECK(used == used0, "and the heap's top stays where it was (%u bytes used, were %u)", used, used0);
+    uint32_t big = heap_alloc(1 << 20, 0);
+    heap_free(big);
+    CHECK(!heap_alloc(0xFFFFFFF8u, 0), "so is one that rounds up past 4 GiB");
+    uint32_t again = heap_alloc(1 << 20, 0);
+    CHECK(again == big, "and the freed 1 MB block is still there for the next request (%08x, got %08x)", big, again);
+    heap_free(again);
+    /* as the game sees it: NULL, and ERROR_NOT_ENOUGH_MEMORY */
+    uint32_t heap = callv(c, import("KERNEL32.DLL!GetProcessHeap"), 0, NULL);
+    K("SetLastError", 0);
+    CHECK(!K("HeapAlloc", heap, 0, 0xFFFFFF00u) && last_error() == 8, "HeapAlloc fails with ERROR_NOT_ENOUGH_MEMORY");
+    K("SetLastError", 0);
+    CHECK(!K("GlobalAlloc", 0, 0xFFFFFFF8u) && last_error() == 8, "and so does GlobalAlloc");
+    uint32_t p = K("HeapAlloc", heap, 0, 100);
+    memset(HP(p), 0x5A, 100);
+    K("SetLastError", 0);
+    CHECK(!K("HeapReAlloc", heap, 0, p, 0xFFFFFFF8u) && last_error() == 8, "HeapReAlloc to a size that rounds past 4 GiB fails");
+    CHECK(!K("HeapReAlloc", heap, 0, p, 0xFFFFFF00u), "and to one bigger than the heap");
+    CHECK(heap_size(p) == 112 && R8(p) == 0x5A && R8(p + 99) == 0x5A, "the block stays as it was");
+    uint32_t q = K("HeapReAlloc", heap, 0, p, 5000);
+    CHECK(q && heap_size(q) >= 5000 && R8(q) == 0x5A && R8(q + 99) == 0x5A, "an ordinary size still grows it");
+    K("HeapFree", heap, 0, q);
+    /* the largest block is the whole heap less its header; a byte more used to abort ("guest heap exhausted") */
+    CHECK(!heap_alloc(GUEST_HEAP_HI - GUEST_HEAP_BASE - 15, 0), "a byte more than the largest block there can be is refused");
 }
 
 /* ------------------------------------------------------------------ the VirtualAlloc window */
@@ -288,6 +324,59 @@ static void test_d3d(void) {
     g_render = &g_render_headless;
 }
 
+#define D3DERR_INVALIDCALL 0x8876086Cu
+#define D3DERR_OUTOFVIDEOMEMORY 0x8876017Cu
+
+/* Sizes from a texture file's header. Texture keeps 14 levels: a 16384-wide one wrote a 15th over the fields after
+   them (GetSurfaceLevel(0) then gave the game 0x4), and a surface's width * height * bpp could wrap. */
+static void test_d3d_sizes(void) {
+    uint32_t d3d = callv(c, import("D3D8.DLL!Direct3DCreate8"), ARGS(220));
+    uint32_t pp = gbuf(13 * 4), out = gbuf(4), desc = gbuf(32);
+    W32(pp, 640); W32(pp + 4, 480); W32(pp + 8, 22); W32(pp + 28, 1); W32(pp + 32, 1); W32(pp + 36, 80);
+    COM(d3d, "CreateDevice", 0, 1, MAIN_HWND, 0x40, pp, out);
+    uint32_t dev = R32(out);
+    int live0 = com_live_objects();
+    W32(pp, 16384);
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, d3d, "CreateDevice", 0, 1, MAIN_HWND, 0x40, pp, out),
+          "a device with a 16384-wide back buffer fails with D3DERR_INVALIDCALL");
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateTexture", 16384, 1, 0, 0, 21, 0, out), "so does a 16384 x 1 texture");
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateTexture", 65536, 1, 0, 0, 21, 0, out), "and 65536 x 1");
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateTexture", 1, 16384, 0, 0, 21, 0, out), "and 1 x 16384");
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateTexture", 0, 64, 0, 0, 21, 0, out) &&
+          CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateTexture", 64, 0, 0, 0, 21, 0, out), "and one 0 wide or high");
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateCubeTexture", 16384, 1, 0, FMT_DXT1, 0, out) &&
+          CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateCubeTexture", 0, 1, 0, 21, 0, out), "a cube texture 16384 or 0 across");
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateImageSurface", 16384, 16, 21, out), "an image surface 16384 wide");
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateRenderTarget", 0x40000000, 16, 21, 0, 1, out),
+          "a render target 2^30 wide (its pitch wrapped to 0)");
+    CHECK(CREATE_FAILS(D3DERR_INVALIDCALL, out, dev, "CreateDepthStencilSurface", 16, 16384, 80, 0, out), "a depth buffer 16384 high");
+    CHECK(CREATE_FAILS(D3DERR_OUTOFVIDEOMEMORY, out, dev, "CreateVertexBuffer", 0xFFFFFFF0u, 0, 0, 0, out) &&
+          CREATE_FAILS(D3DERR_OUTOFVIDEOMEMORY, out, dev, "CreateIndexBuffer", 0xFFFFFFF8u, 0, 101, 0, out),
+          "vertex and index buffers near 4 GiB (length + 16 wrapped) fail with D3DERR_OUTOFVIDEOMEMORY");
+    /* the largest size, and ordinary ones, still work */
+    CHECK(COM(dev, "CreateTexture", 16383, 1, 0, 0, 21, 0, out) == S_OK, "a 16383 x 1 texture is fine");
+    uint32_t tex = R32(out);
+    CHECK(comv(tex, "GetLevelCount", 0, NULL) == 14, "with all 14 levels");
+    CHECK(COM(tex, "GetSurfaceLevel", 13, out) == S_OK && com_get(R32(out)), "the last one a surface");
+    release(R32(out));
+    COM(tex, "GetSurfaceLevel", 0, out);
+    uint32_t surf = R32(out);
+    CHECK(com_get(surf) && COM(surf, "GetDesc", desc) == S_OK && R32(desc + 24) == 16383, "level 0 is 16383 wide");
+    release(surf);
+    release(tex);
+    CHECK(COM(dev, "CreateImageSurface", 16383, 1, 21, out) == S_OK && com_get(R32(out)), "so is a 16383 x 1 image surface");
+    release(R32(out));
+    CHECK(COM(dev, "CreateCubeTexture", 64, 0, 0, 21, 0, out) == S_OK && com_get(R32(out)), "a 64 cube texture");
+    release(R32(out));
+    CHECK(COM(dev, "CreateRenderTarget", 64, 64, 21, 0, 1, out) == S_OK && com_get(R32(out)), "a 64 x 64 render target");
+    release(R32(out));
+    CHECK(COM(dev, "CreateDepthStencilSurface", 64, 64, 80, 0, out) == S_OK && com_get(R32(out)), "a depth buffer");
+    release(R32(out));
+    CHECK(COM(dev, "CreateVertexBuffer", 4096, 0, 0, 0, out) == S_OK && com_get(R32(out)), "and a 4 KB vertex buffer");
+    release(R32(out));
+    CHECK(com_live_objects() == live0, "nothing left over (%d)", com_live_objects() - live0);
+}
+
 /* ------------------------------------------------------------------ DirectSound buffers */
 
 static const uint8_t IID_Notify[16] = { 0x83, 0x07, 0x21, 0xB0, 0xCD, 0x89, 0xD0, 0x11, 0xAF, 0x08, 0x00, 0xA0, 0xC9, 0x25, 0xCD, 0x16 };
@@ -339,6 +428,33 @@ static void test_dsound(void) {
     CHECK(dsound_live_buffers() == live0 && heap_size(mem) == 0, "then gone, sound data too");
 }
 
+/* A buffer's size comes from the game's sound data: size + 16 wrapped near 4 GiB into a 16-byte block. */
+#define DSERR_INVALIDPARAM 0x80070057u
+static void test_dsound_sizes(void) {
+    uint32_t out = gbuf(4), p1 = gbuf(4), n1 = gbuf(4), p2 = gbuf(4), n2 = gbuf(4);
+    callv(c, import("DSOUND.DLL!#1"), ARGS(0, out, 0));
+    uint32_t ds = R32(out), wfx = gbuf(18), desc = gbuf(20);
+    W16(wfx, 1); W16(wfx + 2, 2); W32(wfx + 4, 44100); W32(wfx + 8, 176400); W16(wfx + 12, 4); W16(wfx + 14, 16);
+    W32(desc, 20); W32(desc + 16, wfx);
+    int live0 = dsound_live_buffers();
+    const uint32_t bad[] = { 0xFFFFFFF8u, 0x10000000u /* DSBSIZE_MAX + 1 */, 3, 0 };
+    for (int i = 0; i < 4; i++) {
+        W32(desc + 8, bad[i]);
+        CHECK(CREATE_FAILS(DSERR_INVALIDPARAM, out, ds, "CreateSoundBuffer", desc, out, 0),
+              "a %u-byte buffer fails with DSERR_INVALIDPARAM", bad[i]);
+    }
+    CHECK(dsound_live_buffers() == live0, "and no buffer (%d)", dsound_live_buffers() - live0);
+    W32(desc + 8, 4);
+    CHECK(COM(ds, "CreateSoundBuffer", desc, out, 0) == S_OK, "DSBSIZE_MIN, 4 bytes, is fine");
+    uint32_t b = R32(out);
+    CHECK(COM(b, "Lock", 0, 0, p1, n1, p2, n2, 2) == S_OK && R32(n1) == 4 && heap_size(R32(p1)) >= 4, "and holds 4 bytes");
+    release(b);
+    W32(desc + 4, 1 /* DSBCAPS_PRIMARYBUFFER */); W32(desc + 8, 0); W32(desc + 16, 0);
+    CHECK(COM(ds, "CreateSoundBuffer", desc, out, 0) == S_OK && R32(out), "the primary buffer (size 0, no data) still works");
+    release(R32(out));
+    CHECK(dsound_live_buffers() == live0, "all released (%d)", dsound_live_buffers() - live0);
+}
+
 /* ------------------------------------------------------------------ GetProcAddress and the import table */
 
 static void dummy(CPU *cpu) { (void)cpu; }
@@ -376,13 +492,16 @@ int main(void) {
 
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "guest heap: best fit, split", test_heap },
+        { "guest heap: a size it can never hold fails, as on Windows", test_heap_limits },
         { "VirtualAlloc window: release, reuse, zeroing, merging", test_valloc },
         { "file mappings: views, descriptors, a full window", test_mapping },
         { "threads: ExitThread wakes waiters, stacks reused", test_threads },
         { "critical sections: re-initialized while held", test_critical_section },
         { "dynamic code regions: merged, bounded", test_dyncode },
         { "Direct3D 8: surface levels go with their texture", test_d3d },
+        { "Direct3D 8: sizes the level arrays can't hold fail", test_d3d_sizes },
         { "DirectSound: released buffers go away", test_dsound },
+        { "DirectSound: buffer sizes outside its limits fail", test_dsound_sizes },
         { "GetProcAddress: one slot per function, bounded table", test_imports },
     };
     int failed_tests = 0, total = (int)(sizeof tests / sizeof tests[0]);

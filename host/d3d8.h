@@ -21,7 +21,7 @@ typedef struct Texture {
     int type;                     /* RT_TEXTURE or RT_CUBETEXTURE */
     uint32_t format, usage, pool;
     uint32_t width, height, levels, faces;
-    uint32_t mem[6][14];          /* guest memory per face/level */
+    uint32_t mem[6][14];          /* guest memory per face/level (14 levels: what MAX_DIM in d3d8.c allows) */
     uint32_t pitch[14], lw[14], lh[14], size[14];
     uint32_t surfaces[6][14];     /* guest surface objects, created on demand */
     uint32_t version;             /* bumped on every unlock: backends re-upload when it changes */

@@ -29,6 +29,9 @@ static uint32_t g_heap_free_bytes;   /* payload of the blocks on those lists (fo
 static uint32_t round16(uint32_t n) { return (n + 15) & ~15u; }
 
 uint32_t heap_alloc(uint32_t size, int zero) {
+    /* No block can be bigger than the whole heap less its header: fail (0), as Windows does. Checked first so the
+       rounding and the header below can't wrap: a size near 4 GiB came back as a block over live ones. */
+    if (size > HEAP_HI - HEAP_LO - 16) return 0;
     uint32_t sz = round16(size ? size : 1), a = 0;
     pthread_mutex_lock(&g_heap_lock);
     uint32_t cls = sz / 16;
@@ -101,8 +104,9 @@ uint32_t heap_size(uint32_t a) {
 uint32_t heap_realloc(uint32_t a, uint32_t size, int zero) {
     if (!a) return heap_alloc(size, zero);
     uint32_t old = heap_size(a);
-    if (round16(size) <= old) return a;
+    if (size <= old) return a;   /* old is whole 16-byte units; round16(size) wrapped to 0 here for sizes near 4 GiB */
     uint32_t b = heap_alloc(size, 0);
+    if (!b) return 0;            /* too big: the block stays as it was, as with HeapReAlloc on Windows */
     memcpy(HP(b), HP(a), old);
     if (zero) memset(HP(b + old), 0, R32(b - 16) - old);
     heap_free(a);

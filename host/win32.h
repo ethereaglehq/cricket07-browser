@@ -41,9 +41,9 @@ extern int g_log;
 
 /* ------------------------------------------------------------------ guest memory allocation */
 
-uint32_t heap_alloc(uint32_t size, int zero);
+uint32_t heap_alloc(uint32_t size, int zero);      /* 0 for more than the whole heap (a full heap aborts) */
 void heap_free(uint32_t a);
-uint32_t heap_realloc(uint32_t a, uint32_t size, int zero);
+uint32_t heap_realloc(uint32_t a, uint32_t size, int zero);   /* 0 likewise, and the block stays as it was */
 uint32_t heap_size(uint32_t a);
 uint32_t guest_valloc(uint32_t size);              /* page-granular, zero-filled; 0 when the window is full */
 enum { VA_ALLOC = 1, VA_VIEW, VA_STACK };          /* what a VirtualAlloc-window region holds */
