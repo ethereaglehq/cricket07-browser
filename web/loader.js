@@ -10,6 +10,8 @@
 //              ?netplay=<url> (the room server for online play, see server/; default: this page's origin)
 //              ?join=<room code>
 //              ?watchdog=N (seconds without a new frame before the page offers a restart, default 15; 0: never)
+//              ?desktop (the page runs in the desktop app, desktop/: invites carry the room code, not a link, and the
+//              storage is the app's own)
 //              ?adaptive=0 (online: keep the input delay the game started with, instead of adapting it to
 //              the connection as it goes)
 //
@@ -24,6 +26,7 @@ const params = new URLSearchParams(location.search);
 const OPFS_DIR = 'rcgame';
 const MARKER = '.installed.json';   // { version } once every file is copied
 const NETPLAY_BASE = new URL(params.get('netplay') || './', location.href).href.replace(/\/?$/, '/');
+const DESKTOP = params.has('desktop');
 const status = (t) => { $('status').textContent = t; };
 // the launcher's screens (index.html): loading, home, online, lobby
 const show = (view) => { for (const v of document.querySelectorAll('#panel .view')) v.classList.toggle('hidden', v.id !== 'view-' + view); };
@@ -716,7 +719,8 @@ async function showSaves() {
   // sites not visited for a while), so say so next to the backup buttons.
   const kept = await navigator.storage.persisted?.().catch(() => false);
   $('saves-note').classList.toggle('warn', !kept);
-  $('saves-note').innerHTML = (kept ? '' : 'This browser may clear the game’s storage, saves included, when the disk gets full ' +
+  $('saves-note').innerHTML = (kept ? '' : DESKTOP ? 'If this computer runs out of disk space, the app’s storage could be cleared, ' +
+    'saves included, so keep a backup. ' : 'This browser may clear the game’s storage, saves included, when the disk gets full ' +
     'or after you haven’t visited for a while, so keep a backup. ') + 'The game keeps only what you save in <b>My Cricket → Load / Save</b>.';
 }
 
@@ -904,7 +908,8 @@ function setupOnline() {
     const invite = new URL(location.href);
     invite.search = `?join=${code}` + (params.get('netplay') ? `&netplay=${encodeURIComponent(params.get('netplay'))}` : '');
     $('np-room').textContent = code;
-    $('invite').textContent = invite.href;
+    // in the app a link would open nothing: the code, and where it goes
+    $('invite').textContent = DESKTOP ? `Join my Cricket 07 match: open Cricket 07, choose Play Multiplayer and join with the code ${code}` : invite.href;
     const version = await buildVersion();
     let session = null;
     const left = new Set();
@@ -977,11 +982,13 @@ function setupOnline() {
     show('online');
   }
   $('np-leave').onclick = () => { leave(); msg(''); };
+  const copyLabel = DESKTOP ? 'Copy room code' : 'Copy invite link';
+  $('np-copy').textContent = copyLabel;
   $('np-copy').onclick = async () => {
     const b = $('np-copy');
-    try { await navigator.clipboard.writeText($('invite').textContent); b.textContent = 'Link copied'; }
+    try { await navigator.clipboard.writeText($('invite').textContent); b.textContent = DESKTOP ? 'Code copied' : 'Link copied'; }
     catch { b.textContent = 'Copy failed: share the code instead'; }
-    setTimeout(() => { b.textContent = 'Copy invite link'; }, 2000);
+    setTimeout(() => { b.textContent = copyLabel; }, 2000);
   };
 
   const code5 = () => Array.from(crypto.getRandomValues(new Uint8Array(5)), (b) => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[b % 32]).join('');

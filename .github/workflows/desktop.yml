@@ -1,0 +1,58 @@
+# Builds the desktop app on a Mac with desktop/build-mac.sh and tests it, without any game: once with the
+# stand-in engine, and once with a real engine built from a tiny Windows program (tests/desktop/toy.c) through
+# the same steps a game goes through (Ghidra, translator/x86toc.py, Emscripten, the .app).
+name: Desktop app
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read   # the build only reads the code
+
+jobs:
+  mac:
+    runs-on: macos-15   # Apple Silicon
+    timeout-minutes: 60
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4, pinned to its commit
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020   # v4, pinned to its commit
+        with:
+          node-version: 22
+
+      # Playwright drives the app (Electron needs no browser download); wrangler runs the room server,
+      # from deploy/vm/tools' lockfile with no install scripts
+      - name: Playwright and wrangler
+        timeout-minutes: 10
+        run: |
+          npm ci --ignore-scripts --no-fund --no-audit --prefix deploy/vm/tools
+          npm i -g --ignore-scripts playwright@1.56.1
+
+      - name: The app with the stand-in engine
+        run: bash desktop/build-mac.sh --stand-in --out dist-standin
+
+      - name: Its tests
+        run: |
+          PACKAGED=1 ELECTRON="$PWD/dist-standin/Cricket 07.app/Contents/MacOS/Electron" \
+            WRANGLER="$PWD/deploy/vm/tools/node_modules/.bin/wrangler" NODE_PATH="$(npm root -g)" node tests/desktop/run.js
+
+      - name: A tiny Windows program to build an engine from
+        timeout-minutes: 15
+        run: |
+          brew install mingw-w64
+          mkdir -p toygame
+          i686-w64-mingw32-gcc -O1 -nostdlib -nostartfiles -e _start@0 -Wl,--subsystem,windows -o toygame/game.exe tests/desktop/toy.c -lkernel32
+
+      - name: The app with an engine built from it (as from a game)
+        run: bash desktop/build-mac.sh "$PWD/toygame" --out dist-real
+
+      - name: The engine runs in the app
+        run: |
+          PACKAGED=1 REAL_GAME="$PWD/toygame" ELECTRON="$PWD/dist-real/Cricket 07.app/Contents/MacOS/Electron" \
+            NODE_PATH="$(npm root -g)" node tests/desktop/run.js "real engine"

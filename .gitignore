@@ -21,3 +21,7 @@ node_modules/
 
 # npm installs (deploy/vm/tools: wrangler from its lockfile)
 node_modules/
+
+# the desktop build (desktop/build-mac.sh): its work files and the app
+work/
+dist/

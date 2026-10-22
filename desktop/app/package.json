@@ -1,0 +1,9 @@
+{
+  "name": "cricket07",
+  "productName": "Cricket 07",
+  "version": "1.0.0",
+  "description": "Cricket 07 from your own copy of the game, in a window of its own (see desktop/README.md)",
+  "main": "main.js",
+  "private": true,
+  "license": "MIT"
+}
