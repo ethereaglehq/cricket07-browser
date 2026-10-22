@@ -214,7 +214,7 @@ test('saves: automatic backups into a folder', async ({ browser, base }) => {
   assert.strictEqual(names.length, 11);
   assert.ok(!names.includes('Cricket 07 saves 2025-01-01.zip'), 'oldest backup kept');
   assert.ok(names.includes('my notes.txt'));
-  assert.match(await page.textContent('#saves-folder-row'), /Automatic backups go to “picked-folder”/);
+  await page.waitForFunction(() => /Automatic backups go to “picked-folder”/.test(document.getElementById('saves-folder-row').textContent));
   // next visit after more saving: the folder copy is refreshed by itself
   await playAndSave(page, 2);
   await page.waitForFunction(() => /backed up today/.test(document.getElementById('saves-status').textContent));
