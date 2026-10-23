@@ -39,7 +39,9 @@ WebSocket upgrades included (online play uses them on `/netplay/`).
 
 - **Update** to the newest code of the branch: run the same command again, with the same `CRICKET07_LISTEN` if
   you used one.
-- **Logs:** `journalctl -u cricket07-web -u cricket07-rooms -f`
+- **Logs:** `journalctl -u cricket07-web -u cricket07-rooms -f`. Every request is also written to
+  `/var/lib/cricket07/logs/access.log`, one JSON line each. Caddy keeps 5 files of 50 MiB at most. Read it with
+  `sudo tail -f /var/lib/cricket07/logs/access.log`.
 - **Remove:**
 
   ```sh
@@ -62,7 +64,8 @@ WebSocket upgrades included (online play uses them on `/netplay/`).
   - `cricket07-rooms`: the room server, on 127.0.0.1:8787 behind Caddy.
 
   Both run as the unprivileged user `cricket07` in a systemd sandbox. They can write only to
-  `/var/lib/cricket07`, see nothing in `/home`, and can't gain privileges.
+  `/var/lib/cricket07`, see nothing in `/home`, and can't gain privileges. That's why the access log lives there
+  rather than in `/var/log`.
 - **The room server's ticket secret:**
   - Made on the VM, in `/etc/cricket07/netplay-secret`.
   - Readable by root and the service alone.
