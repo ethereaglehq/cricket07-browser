@@ -12,9 +12,12 @@
   // for the direct channels, from the ticket), relayOnly (direct channels only through TURN), adaptive (false:
   // keep the session's input delay all game), testLoss (tests: drop this fraction of direct packets on arrival),
   // onLobby(lobby),
-  // onStart(session), onLeft(slot), onError(message), onClose(), reconnectUrl() (async: a fresh url with a
-  // new ticket), onReconnect(state) }. If the room connection drops during a game it reconnects, rejoins
-  // its slot and resends its recent inputs (the others wait in lockstep meanwhile).
+  // onStart(session), onLeft(slot, why: 'quit' | 'closed' | 'timeout', or '' in the lobby), onError(message), onClose(),
+  // reconnectUrl() (async: a fresh url with a new ticket), onReconnect(state, attempt), onAway(slot, graceMs),
+  // onBack(slot), onEnded(message) }. If the room connection drops during a game it reconnects, rejoins its slot
+  // (with a key only this page holds, so no one else can take it) and resends its recent inputs; the others wait
+  // in lockstep meanwhile, told why (onAway, then onBack, or onLeft once the room gives up on it). If the room
+  // won't take it back (the match ended), onEnded.
   //
   // Inputs go through the room (a relay every peer can reach) and, where WebRTC is available, also over a
   // direct data channel to each peer, set up through the room in the lobby. The game stores each frame's
@@ -94,6 +97,7 @@
   function connect(opts) {
     let ws = null;
     let started = false, closing = false, retries = 0, heard = Date.now();
+    const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
     const history = [];       // our recent input batches, resent after a reconnect
     const HISTORY = 600;
     const recent = [];        // our last few inputs, repeated in every direct packet
@@ -151,8 +155,8 @@
       ws.onopen = () => {
         retries = 0;
         heard = Date.now();
-        if (rejoin) send({ t: 'rejoin', slot: me, version: opts.version });
-        else send({ t: 'hello', name: opts.name, version: opts.version });
+        if (rejoin) send({ t: 'rejoin', slot: me, key, version: opts.version });
+        else send({ t: 'hello', name: opts.name, key, version: opts.version });
         send({ t: 'ping', ts: Date.now() });
       };
       ws.onclose = () => {
@@ -172,7 +176,7 @@
       reconnect();
     }
     async function reconnect() {
-      opts.onReconnect?.('connecting');
+      opts.onReconnect?.('connecting', retries + 1);
       await new Promise((r) => setTimeout(r, Math.min(5000, 500 * 2 ** retries++)));
       try { open(opts.reconnectUrl ? await opts.reconnectUrl() : opts.url, true); }
       catch { reconnect(); }
@@ -312,9 +316,23 @@
         for (const text of history) ws.send(text);
         opts.onReconnect?.('rejoined');
       }
+      else if (m.t === 'error' && m.ended && started) {   // the room won't take this game back: it's over
+        closing = true;
+        opts.onEnded?.(String(m.msg || 'The match ended.'));
+      }
       else if (m.t === 'error') opts.onError?.(m.msg);
+      else if (m.t === 'away' && slotOk(m.slot) && m.slot !== me) opts.onAway?.(m.slot, Number(m.grace) || 0);
+      else if (m.t === 'back' && slotOk(m.slot) && m.slot !== me) {
+        // what we sent while they were away reached no one: again (repeats are harmless, each frame is kept once)
+        for (const text of history) if (ws.readyState === 1) ws.send(text);
+        opts.onBack?.(m.slot);
+      }
       else if (m.t === 'sig' && webrtc && slotOk(m.from) && m.from !== me) onSignal(m.from, m.data).catch((e) => console.warn('webrtc:', e));
-      else if (m.t === 'left' && slotOk(m.slot)) { gone.add(m.slot); if (game) game._netplay_player_left(m.slot); opts.onLeft?.(m.slot); }
+      else if (m.t === 'left' && slotOk(m.slot)) {
+        gone.add(m.slot);
+        if (game) game._netplay_player_left(m.slot);
+        opts.onLeft?.(m.slot, ['quit', 'closed', 'timeout'].includes(m.why) ? m.why : '');
+      }
       else onMessage(m, null);
     }
 
@@ -446,7 +464,9 @@
         for (const m of early.splice(0)) deliver(M, m);
         timer = setInterval(pump, pollMs);
       },
-      close() { closing = true; ws.close(); },
+      // leaving on purpose (why: 'quit', or 'closed' with the page): the room tells the others at once, where a
+      // dropped connection would keep them waiting
+      close(why = 'quit') { closing = true; send({ t: 'bye', why }); ws.close(); },
       testDrop() { abandon(); },   // tests: lose the room connection as a network drop would
       rtt: () => rtt,
       direct: () => [...peers.entries()].filter(([, p]) => p.dc?.readyState === 'open').map(([slot]) => slot),

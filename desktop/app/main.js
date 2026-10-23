@@ -129,6 +129,14 @@ else {
     contents.on('will-redirect', (e, url) => { if (!ours(url)) e.preventDefault(); });
     contents.setWindowOpenHandler(({ url }) => { openOutside(url); return { action: 'deny' }; });
     contents.on('will-attach-webview', (e) => e.preventDefault());
+    // During an online match the page asks before it closes (beforeunload); Electron leaves the asking to the app
+    contents.on('will-prevent-unload', (e) => {
+      const choice = dialog.showMessageBoxSync(BrowserWindow.fromWebContents(contents), {
+        type: 'question', buttons: ['Leave', 'Stay'], defaultId: 1, cancelId: 1, message: 'Leave the match?',
+        detail: 'Your friend’s game is waiting for yours. If you leave now, the match ends.',
+      });
+      if (choice === 0) e.preventDefault();   // leave anyway
+    });
   });
   app.whenReady().then(() => {
     protocol.handle(SCHEME, serve);

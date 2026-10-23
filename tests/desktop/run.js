@@ -205,7 +205,23 @@ test('online: two copies of the app play each other through the room server', as
     await a.page.click('#np-start');
     await Promise.all([waitFrames(a.page, 200, 40000), waitFrames(b.page, 200, 40000)]);
     for (const { page } of [a, b]) assert.strictEqual(await page.evaluate(() => window.recomp._netplay_status(2)), 0, 'desync');
-  } finally { await a.app.close(); await b.app.close(); }
+    // closing the window mid-match asks first ("Stay" keeps it); leaving tells the other player at once
+    const answer = (choice) => b.app.evaluate(({ dialog }, choice) => {
+      global.asked = global.asked || [];
+      dialog.showMessageBoxSync = (win, o) => { global.asked.push(o.message); return choice; };
+    }, choice);
+    const closeWindow = () => b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
+    b.page.on('dialog', () => {});   // the app asks (will-prevent-unload), not the page: Playwright mustn't answer it
+    await answer(1);
+    await closeWindow();
+    await sleep(1000);
+    assert.strictEqual(await b.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length), 1, 'Stay closed the window');
+    await b.page.keyboard.press('ArrowLeft');   // the player does something before trying again
+    await answer(0);
+    await closeWindow().catch(() => {});   // the app quits with its last window
+    await a.page.waitForFunction(() => document.getElementById('netwait-title').textContent === 'The match is over', null, { timeout: 10000 });
+    assert.strictEqual(await a.page.textContent('#netwait-why'), 'Guest closed the game, so the match can’t go on.');
+  } finally { await a.app.close(); await b.app.close().catch(() => {}); }
 }, { online: true });
 
 test('a real engine build runs in the app: threads, its files in storage, WebGPU', async () => {

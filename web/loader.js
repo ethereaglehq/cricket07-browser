@@ -613,8 +613,57 @@ async function copyDiagnostics() {
   setTimeout(() => { b.textContent = 'Copy diagnostics'; }, 3000);
 }
 
+// ------------------------------------------------------------------ leaving an online match
+
+// The overlay over an online game that waits: this page reconnecting to the room, another player whose
+// connection dropped (only while the game actually waits for them: a direct connection may still carry their
+// inputs), or the match over. Each with the way out.
+function netOverlay(net, nameOf) {
+  const now = performance.now();
+  const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+  let waiting = false;
+  try { waiting = !!engine?.M._netplay_status(4); } catch { /* not started */ }
+  let title = '', why = '';
+  if (engineDead || haltMode) title = '';
+  else if (net.over) { title = 'The match is over'; why = net.over; }
+  else if (net.me && now - net.me > 1500) {
+    title = 'Your connection dropped';
+    why = `Reconnecting to the room${net.attempt > 1 ? ` (try ${net.attempt})` : ''}… ${clock(now - net.me)}. ` +
+      'Your friend’s game waits for yours meanwhile.';
+  } else if (waiting && net.away.size) {
+    const [slot, a] = [...net.away][0];
+    if (now - a.at > 1000) {
+      title = `${nameOf(slot)}’s connection dropped`;
+      why = `Waiting for them to come back… ${clock(now - a.at)}.` +
+        (a.grace ? ` The match ends if they aren’t back within ${Math.round(a.grace / 60000) || 1} minutes.` : '');
+    }
+  }
+  $('netwait').classList.toggle('hidden', !title);
+  if (!title) return;
+  $('netwait-title').textContent = title;
+  $('netwait-why').textContent = why;
+  $('netwait-leave').textContent = net.over ? 'Back to menu' : 'Leave the match';
+}
+
+// During an online match, closing or reloading the page asks first: the other player's game waits for this one,
+// and a closed page can't come back. The page's own ways out (Restart, Leave the match) go through leavePage.
+let matchOn = false, leaving = false;
+window.addEventListener('beforeunload', (e) => {
+  if (!matchOn || leaving || engineDead) return;
+  e.preventDefault();
+  e.returnValue = '';   // older browsers
+});
+function leavePage(url) {
+  leaving = true;
+  if (url) location.href = url; else location.reload();
+}
+// and when the page does go (closed, reloaded, Restart), the room hears it from the page itself, so the others
+// are told at once instead of waiting for a connection that won't come back
+let netClient = null;
+window.addEventListener('pagehide', () => { if (matchOn) netClient?.close('closed'); });
+
 function setupHalt() {
-  $('halt-restart').onclick = () => location.reload();
+  $('halt-restart').onclick = () => leavePage();
   $('halt-wait').onclick = () => { health.lastFrameAt = performance.now(); unhalt(); };
   $('halt-copy').onclick = copyDiagnostics;
   $('halt-more').ontoggle = () => { if ($('halt-more').open) $('halt-report').value = diagnostics(); };
@@ -913,10 +962,21 @@ function setupOnline() {
     const version = await buildVersion();
     let session = null;
     const left = new Set();
+    // A player away (their connection dropped), gone, or this page reconnecting, for the overlay that says why
+    // the game waits. away: slot -> { at, grace }; me: reconnecting since; over: why the match ended.
+    const net = { away: new Map(), me: 0, attempt: 0, over: '' };
+    const nameOf = (slot) => lastPlayers.find((p) => p.slot === slot)?.name || `Player ${slot + 1}`;
     const me = client = RcNetplay.connect({
       url, name, version, reconnectUrl: roomUrl, iceServers, relayOnly: params.get('turn') === 'only',
       adaptive: params.get('adaptive') !== '0',
-      onReconnect(state) { if (session) session.reconnecting = state === 'connecting'; },
+      onReconnect(state, attempt) {
+        if (session) session.reconnecting = state === 'connecting';
+        net.me = state === 'connecting' ? net.me || performance.now() : 0;
+        net.attempt = attempt || 0;
+      },
+      onAway(slot, grace) { net.away.set(slot, { at: performance.now(), grace }); },
+      onBack(slot) { net.away.delete(slot); },
+      onEnded(m) { net.over = m; matchOn = false; },
       onFiles(done, size, ok) {
         msg(ok ? 'The host’s saves arrived: this match starts from them.' : `Receiving the host’s saves… ${Math.round(done * 100)}%`);
       },
@@ -968,9 +1028,20 @@ function setupOnline() {
       },
       onStart(s) {
         session = { ...s, client, left };
+        matchOn = true;
+        netClient = client;
+        setInterval(() => netOverlay(net, nameOf), 500);
         run(session).catch(fail);
       },
-      onLeft(slot) { left.add(slot); },
+      onLeft(slot, why) {
+        left.add(slot);
+        net.away.delete(slot);
+        if (!session || !why) return;
+        const who = nameOf(slot);
+        net.over = why === 'timeout' ? `${who} didn’t come back in time, so the match can’t go on.`
+          : why === 'quit' ? `${who} left the match.` : `${who} closed the game, so the match can’t go on.`;
+        matchOn = false;
+      },
       onError(e) { msg(e); setTimeout(() => { if ($('np-msg').textContent === e) msg(''); }, 8000); },
       onClose() { if (!session && client === me) { client = null; show('online'); msg('Disconnected from the room.'); } },
     });
@@ -982,6 +1053,13 @@ function setupOnline() {
     show('online');
   }
   $('np-leave').onclick = () => { leave(); msg(''); };
+  // out of a running match: back to the home screen (a fresh page: the game can't be stopped and started again)
+  $('netwait-leave').onclick = () => {
+    client?.close();
+    const home = new URL(location.href);
+    home.searchParams.delete('join');
+    leavePage(home.href);
+  };
   const copyLabel = DESKTOP ? 'Copy room code' : 'Copy invite link';
   $('np-copy').textContent = copyLabel;
   $('np-copy').onclick = async () => {

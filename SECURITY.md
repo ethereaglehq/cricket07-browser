@@ -60,6 +60,9 @@ please report it to whoever runs the site (for this repository: open an issue, o
   the other, as any peer-to-peer game does. `?turn=only` sends them through the room server's relay instead,
   which keeps it hidden.
 - Room tickets are signed with a secret only the server knows (`NETPLAY_SECRET`).
+- **A dropped player's place** in a running match (kept for 3 minutes) can only be taken back with a key their
+  own page made when it joined, which the server never shows anyone: someone else with the room code gets
+  nowhere.
 
 ## The desktop app (`desktop/`)
 

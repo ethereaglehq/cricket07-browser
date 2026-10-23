@@ -19,6 +19,7 @@ const { start } = require('./server');
 
 const ROOT = path.join(__dirname, '..', '..');
 const tests = [];
+const NodeWebSocket = globalThis.WebSocket;   // tests that stand a WebSocket in for it put this one back
 const test = (name, fn, { online = false } = {}) => tests.push({ name, fn, online });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -477,7 +478,7 @@ test('netplay: a hostile host or room server cannot flood a guest with save chun
   assert.ok(errors.some((e) => /damaged/.test(e)), 'wrong-size chunk not reported');
   assert.deepStrictEqual(progress, [0]);   // only the valid announcement registered, no chunk accepted
   c.close();
-  delete global.WebSocket;
+  global.WebSocket = NodeWebSocket;
 });
 
 test('netplay: hostile input messages are checked before the game or the input delay sees them', async () => {
@@ -525,7 +526,7 @@ test('netplay: hostile input messages are checked before the game or the input d
   say({ t: 'left', slot: 1 });
   assert.deepStrictEqual(left, [1]);
   c.close();
-  delete global.WebSocket;
+  global.WebSocket = NodeWebSocket;
 });
 
 test('serve.py: only the page and the build, only to this computer, no listings', async () => {
@@ -945,13 +946,118 @@ test('online: the watchdog waits for the other player, and flags a stuck game', 
   assert.ok(!await haltShown(host), 'the host, waiting for the other player, got the overlay');
 }, { online: true });
 
+// ---- a player away: dropped connections and closed pages
+
+const GRACE_MS = 12000;   // the test room server's wait for a player whose connection dropped (roomServer)
+// The room connection, cut on demand: every socket closes, and new ones fail until __uncut() (a network outage)
+function NET_CUT() {
+  const Native = window.WebSocket, open = new Set();
+  window.__netCut = false;
+  window.WebSocket = class extends Native {
+    constructor(url, protocols) {
+      super(window.__netCut ? 'ws://127.0.0.1:9/cut' : url, protocols);
+      open.add(this);
+      this.addEventListener('close', () => open.delete(this));
+    }
+  };
+  window.__cut = () => { window.__netCut = true; for (const ws of open) ws.close(); };
+  window.__uncut = () => { window.__netCut = false; };
+}
+const noWebRTC = () => { delete window.RTCPeerConnection; };   // inputs only through the room, so a cut stops the game
+
+test('online: a dropped connection: both players are told why the game waits, and it goes on when it\'s back', async (env) => {
+  const players = await startOnline(env, { init: [noWebRTC, NET_CUT] });
+  const [host, guest] = players;
+  await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
+  await guest.evaluate(() => window.__cut());
+  await host.waitForSelector('#netwait:not(.hidden)', { timeout: 15000 });
+  assert.strictEqual(await host.textContent('#netwait-title'), 'Guest’s connection dropped');
+  assert.match(await host.textContent('#netwait-why'), /^Waiting for them to come back… \d:\d\d\./);
+  await guest.waitForSelector('#netwait:not(.hidden)', { timeout: 15000 });
+  assert.strictEqual(await guest.textContent('#netwait-title'), 'Your connection dropped');
+  const frozen = await frameOf(host);
+  await sleep(1500);
+  assert.ok(await frameOf(host) - frozen < 10, 'the host played on without the guest');
+  await guest.evaluate(() => window.__uncut());
+  await Promise.all(players.map((p) => p.waitForSelector('#netwait', { state: 'hidden', timeout: 20000 })));
+  await waitFrames(host, frozen + 120, 30000);
+  await noDesync(players);
+}, { online: true });
+
+test('online: a player who doesn\'t come back: both are told the match is over', async (env) => {
+  if (process.env.BASE_URL) return;   // the site's own room server waits minutes
+  const players = await startOnline(env, { init: [noWebRTC, NET_CUT] });
+  const [host, guest] = players;
+  await Promise.all(players.map((p) => waitFrames(p, 120, 30000)));
+  await guest.evaluate(() => window.__cut());
+  await host.waitForFunction(() => document.getElementById('netwait-title').textContent === 'The match is over', null, { timeout: GRACE_MS + 15000 });
+  assert.strictEqual(await host.textContent('#netwait-why'), 'Guest didn’t come back in time, so the match can’t go on.');
+  assert.strictEqual(await host.textContent('#netwait-leave'), 'Back to menu');
+  // the guest's connection comes back too late: the room won't take its game back
+  await guest.evaluate(() => window.__uncut());
+  await guest.waitForFunction(() => document.getElementById('netwait-title').textContent === 'The match is over', null, { timeout: 20000 });
+  assert.strictEqual(await guest.textContent('#netwait-why'), 'The match ended while you were away.');
+  // Back to menu: the home screen, no question asked (the match is over)
+  await host.click('#netwait-leave');
+  await host.waitForSelector('#view-home:not(.hidden)', { timeout: 15000 });
+}, { online: true });
+
+test('online: closing the page asks first, and once closed the other player is told at once', async (env) => {
+  const [host, guest] = await startOnline(env);
+  await Promise.all([waitFrames(host, 120, 30000), waitFrames(guest, 120, 30000)]);
+  const asked = [];
+  guest.on('dialog', (d) => { asked.push(d.type()); d.accept(); });   // the browser asks; the player leaves anyway
+  const t0 = Date.now();
+  await guest.close({ runBeforeUnload: true });
+  await host.waitForFunction(() => document.getElementById('netwait-title').textContent === 'The match is over', null, { timeout: 10000 });
+  assert.deepStrictEqual(asked, ['beforeunload']);
+  assert.ok(Date.now() - t0 < GRACE_MS, 'the host waited out the grace period');
+  assert.strictEqual(await host.textContent('#netwait-why'), 'Guest closed the game, so the match can’t go on.');
+}, { online: true });
+
+test('room: only the player whose connection dropped can take their place again', async ({ netplay }) => {
+  const ticket = async () => (await (await fetch(new URL('/_netplay_ticket', netplay))).json()).ticket;
+  const code = Array.from({ length: 6 }, () => 'ABCDEFGHJKMNPQRSTUVWXYZ'[Math.floor(Math.random() * 23)]).join('');
+  async function peer(create) {
+    const u = new URL(`/netplay/${code}?ticket=${encodeURIComponent(await ticket())}${create ? '&create=1' : ''}`, netplay);
+    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(u), msgs = [];
+    ws.onmessage = (e) => msgs.push(JSON.parse(e.data));
+    await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+    return { ws, msgs, say: (m) => ws.send(JSON.stringify(m)) };
+  }
+  const heard = async (p, ok) => {
+    for (const t0 = Date.now(); Date.now() - t0 < 8000; await sleep(50)) if (p.msgs.some(ok)) return;
+    assert.fail(`not heard; last messages: ${JSON.stringify(p.msgs.slice(-4))}`);
+  };
+  const host = await peer(true);
+  host.say({ t: 'hello', name: 'H', key: 'a'.repeat(32), version: 'v' });
+  const guest = await peer(false);
+  guest.say({ t: 'hello', name: 'G', key: 'b'.repeat(32), version: 'v' });
+  await heard(host, (m) => m.t === 'lobby' && m.players.length === 2);
+  assert.ok(!JSON.stringify(host.msgs).includes('b'.repeat(32)), 'the lobby showed the guest\'s key');
+  host.say({ t: 'start', delay: 4 });
+  await heard(guest, (m) => m.t === 'start');
+  guest.ws.close();   // dropped (not a closed page)
+  await heard(host, (m) => m.t === 'away' && m.slot === 1);
+  const thief = await peer(false);   // someone else with the room code
+  thief.say({ t: 'rejoin', slot: 1, key: 'c'.repeat(32), version: 'v' });
+  await heard(thief, (m) => m.t === 'error' && m.ended);
+  const back = await peer(false);
+  back.say({ t: 'rejoin', slot: 1, key: 'b'.repeat(32), version: 'v' });
+  await heard(back, (m) => m.t === 'rejoined' && m.slot === 1);
+  await heard(host, (m) => m.t === 'back' && m.slot === 1);
+  for (const p of [host, back]) p.ws.close();
+}, { online: true });
+
 // ------------------------------------------------------------------ runner
 
 async function roomServer() {
   const bin = process.env.WRANGLER;
   const port = 8787 + Math.floor(Math.random() * 500);
-  const args = ['dev', '--local', '--port', String(port), '--var', 'NETPLAY_SECRET:test', '--persist-to',
-    fs.mkdtempSync(path.join(os.tmpdir(), 'c07-rooms-'))];
+  // a short wait for players whose connection dropped (the site's own is minutes), so the tests can outlast it
+  const args = ['dev', '--local', '--port', String(port), '--var', 'NETPLAY_SECRET:test', '--var', `REJOIN_GRACE_MS:${GRACE_MS}`,
+    '--persist-to', fs.mkdtempSync(path.join(os.tmpdir(), 'c07-rooms-'))];
   const proc = bin ? spawn(bin, args, { cwd: path.join(ROOT, 'server') })
     : spawn('npx', ['--yes', 'wrangler', ...args], { cwd: path.join(ROOT, 'server') });
   let out = '';

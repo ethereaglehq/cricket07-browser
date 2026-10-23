@@ -73,13 +73,15 @@ async function iceServers(env) {
 }
 
 const MAX_PLAYERS = 4;
-const REJOIN_GRACE_MS = 15000;
+// How long a running game keeps a player whose connection dropped (the others wait, told why): long enough for a
+// router restart or a change of network. REJOIN_GRACE_MS overrides it (tests).
+const REJOIN_GRACE_MS = 180000;
 
 // One room: the first peer to join hosts. Peers say hello (name, game build), the host starts the session
 // (fixing the player count and input delay), then every input/hash batch a peer sends is relayed to the
 // others. Uses WebSocket hibernation; the lobby lives in the sockets' attachments and durable storage.
 export class NetplayRoom {
-  constructor(ctx) { this.ctx = ctx; }
+  constructor(ctx, env) { this.ctx = ctx; this.grace = Number(env?.REJOIN_GRACE_MS) || REJOIN_GRACE_MS; }
 
   async fetch(request) {
     if (request.headers.get('Upgrade') !== 'websocket') return new Response('Expected a WebSocket', { status: 426 });
@@ -122,22 +124,29 @@ export class NetplayRoom {
       let slot = 0;
       while (used.has(slot)) slot++;
       if (slot >= MAX_PLAYERS) { this.send(ws, { t: 'error', msg: 'The room is full.' }); ws.close(4001, 'full'); return; }
-      ws.serializeAttachment({ ...me, slot, name: String(msg.name || `Player ${slot + 1}`).slice(0, 24), version: String(msg.version || ''), rtt: 0 });
+      // key: the player's secret for rejoining this game after a dropped connection (never sent to anyone)
+      const key = typeof msg.key === 'string' && /^[0-9a-f]{32}$/.test(msg.key) ? msg.key : '';
+      ws.serializeAttachment({ ...me, slot, key, name: String(msg.name || `Player ${slot + 1}`).slice(0, 24), version: String(msg.version || ''), rtt: 0 });
       await this.lobby();
       return;
     }
     if (msg.t === 'ping') { this.send(ws, { t: 'pong', ts: msg.ts }); return; }
+    // leaving on purpose (Leave the match): the others are told at once, not after the grace period
+    if (msg.t === 'bye') { ws.serializeAttachment({ ...me, bye: msg.why === 'closed' ? 'closed' : 'quit' }); return; }
     if (msg.t === 'rejoin' && me.slot < 0) {   // a player of a running game whose connection dropped
       const started = await this.ctx.storage.get('started');
       const slot = Number(msg.slot);
       const away = (await this.ctx.storage.get('away')) || {};
-      if (!started || !(slot in away) || this.peers().some((p) => p.slot === slot)) {
-        this.send(ws, { t: 'error', msg: 'Could not rejoin the game.' }); ws.close(4002, 'rejoin'); return;
+      // only the player who left, by their key: anyone else with the room code gets nowhere
+      if (!started || !(slot in away) || this.peers().some((p) => p.slot === slot) ||
+          (away[slot].key && !timingSafeEqual(String(msg.key || ''), away[slot].key))) {
+        this.send(ws, { t: 'error', msg: 'The match ended while you were away.', ended: true }); ws.close(4002, 'rejoin'); return;
       }
       ws.serializeAttachment({ ...away[slot], slot });
       delete away[slot];
       await this.ctx.storage.put('away', away);
       this.send(ws, { t: 'rejoined', slot });
+      for (const p of this.peers()) if (p.slot !== slot) this.send(p.ws, { t: 'back', slot });
       return;
     }
     if (me.slot < 0) return;
@@ -190,38 +199,40 @@ export class NetplayRoom {
 
   async webSocketClose(ws, code, reason) {
     try { ws.close(code === 1005 || code === 1006 ? 1000 : code, reason); } catch { /* already closed */ }   // complete the handshake
-    await this.left(ws);
+    await this.left(ws, code);
   }
-  async webSocketError(ws) { await this.left(ws); }
+  async webSocketError(ws) { await this.left(ws, 1006); }
 
-  // Lobby: a player who disconnects is gone. In a running game the others are only told after a grace
-  // period, so a player whose connection dropped can rejoin (their game keeps its slot meanwhile and the
-  // others just wait in lockstep).
-  async left(ws) {
+  // Lobby: a player who disconnects is gone. In a running game a player who left on purpose ('bye') or closed the
+  // page (close code 1001: their game is gone with it) is gone at once; one whose connection dropped keeps their
+  // slot for the grace period, so they can rejoin (their game waits meanwhile, and the others' wait in lockstep,
+  // told why: 'away', then 'back' or 'left').
+  async left(ws, code) {
     const me = ws.deserializeAttachment();
     if (me.slot < 0) return;
     ws.serializeAttachment({ ...me, slot: -1 });
     const started = await this.ctx.storage.get('started');
-    if (!started) {
-      for (const p of this.peers()) this.send(p.ws, { t: 'left', slot: me.slot });
-      await this.lobby();
+    if (!started || me.bye || code === 1001) {
+      for (const p of this.peers()) this.send(p.ws, { t: 'left', slot: me.slot, why: started ? me.bye || 'closed' : '' });
+      if (!started) await this.lobby();
       if (this.peers().length === 0) await this.ctx.storage.deleteAll();   // empty room: reusable
       return;
     }
     const away = (await this.ctx.storage.get('away')) || {};
     away[me.slot] = { ...me, at: Date.now() };
     await this.ctx.storage.put('away', away);
-    await this.ctx.storage.setAlarm(Date.now() + REJOIN_GRACE_MS);
+    for (const p of this.peers()) this.send(p.ws, { t: 'away', slot: me.slot, grace: this.grace });
+    await this.ctx.storage.setAlarm(Date.now() + this.grace);
   }
 
   async alarm() {
     const away = (await this.ctx.storage.get('away')) || {};
     let next = 0;
     for (const [slot, a] of Object.entries(away)) {
-      if (Date.now() - a.at >= REJOIN_GRACE_MS) {
-        for (const p of this.peers()) this.send(p.ws, { t: 'left', slot: Number(slot) });
+      if (Date.now() - a.at >= this.grace) {
+        for (const p of this.peers()) this.send(p.ws, { t: 'left', slot: Number(slot), why: 'timeout' });
         delete away[slot];
-      } else next = Math.max(next, a.at + REJOIN_GRACE_MS);
+      } else next = Math.max(next, a.at + this.grace);
     }
     await this.ctx.storage.put('away', away);
     if (next) await this.ctx.storage.setAlarm(next);

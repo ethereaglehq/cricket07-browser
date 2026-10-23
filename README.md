@@ -67,7 +67,10 @@ checked tools) and builds `Cricket 07.app`, online play included. See [desktop/R
 - **Online**, both players need the same patches (the lobby says when they differ), and the host can
   bring their saves, rosters included: every game then starts from the host's saves. Each player's keyboard
   works as their own controller, and the mouse is shared: both players move the one cursor, and either can
-  click (some screens, such as Innings Highlights between innings, only answer the mouse).
+  click (some screens, such as Innings Highlights between innings, only answer the mouse). If a player's
+  connection drops, the match waits up to 3 minutes for them to reconnect, by themselves, and both players see
+  why; closing or reloading the page mid-match asks first, and if a player does leave, the other is told at
+  once.
 
 ## Testing the page without the game
 

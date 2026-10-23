@@ -169,6 +169,13 @@
     font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
   #halt a { color: var(--accent-hi); }
 
+  /* online, when a player is away or gone (loader.js: "a player away"): why the game waits, and a way out */
+  #netwait { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; padding: 20px;
+    background: rgba(4, 9, 6, .7); backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); cursor: auto; }
+  #netwait .card { width: min(100%, 480px); background: rgba(14, 26, 18, .96); box-shadow: 0 20px 50px rgba(0, 0, 0, .5); }
+  #netwait h2 { margin: 0 0 6px; font-size: 20px; }
+  #netwait .actions { display: flex; gap: 10px; margin-top: 14px; }
+
   /* keyboard cheat sheet: shows beside the stage when the viewport has room, because in-game prompts
      use controller glyphs (triangle/circle/×/square, L1, R1) that keyboard players would otherwise have
      to guess at. Hidden in fullscreen, on narrow viewports and by choice (remembered in localStorage). */
@@ -219,6 +226,13 @@
         <path id="fs-icon" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
     </button>
     <div id="fstip" class="hidden">Press <kbd>Alt</kbd> + <kbd>Enter</kbd> for fullscreen</div>
+    <div id="netwait" class="hidden" role="alertdialog" aria-modal="true" aria-labelledby="netwait-title" aria-describedby="netwait-why">
+      <div class="card">
+        <h2 id="netwait-title"></h2>
+        <p id="netwait-why"></p>
+        <div class="actions"><button id="netwait-leave" class="btn ghost">Leave the match</button></div>
+      </div>
+    </div>
     <div id="halt" class="hidden" role="alertdialog" aria-modal="true" aria-labelledby="halt-title" aria-describedby="halt-why">
       <div class="card">
         <h2 id="halt-title">The game stopped</h2>
